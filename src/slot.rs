@@ -17,12 +17,12 @@ impl Symbol {
     // 每种 slot 的概率
     pub fn from_u8(value: u32) -> Self {
         match value % 16 {
-            0..4 => Symbol::Apple,
-            4..7 => Symbol::Origin,
-            7..9 => Symbol::Cherry,
-            9..11 => Symbol::Lemon,
-            11..13 => Symbol::Bell,
-            13..15 => Symbol::Seven,
+            0..=3 => Symbol::Apple,
+            4..=6 => Symbol::Origin,
+            7..=8 => Symbol::Cherry,
+            9..=10 => Symbol::Lemon,
+            11..=12 => Symbol::Bell,
+            13..=14 => Symbol::Seven,
             _ => Symbol::Bar,
         }
     }
