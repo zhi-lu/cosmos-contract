@@ -98,10 +98,10 @@ fn play_game(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
     let mut state = STATE.load(deps.storage)?;
     state.locked_amount += sent_amount;
 
-    // 生成用户 1～100 的随机数(使用用户的地址作为 slat)
-    let user_rand = utils::generate_random_number(&info, &env, info.sender.as_bytes());
-    // 生成的合约 1～100 的随机数 (使用合约的 owner 地址作为 slat)
-    let contract_rand = utils::generate_random_number(&info, &env, state.owner.as_bytes());
+    // 生成用户 1～100 的随机数
+    let user_rand = utils::generate_random_number(&info, &env, b"user");
+    // 生成的合约 1～100 的随机数
+    let contract_rand = utils::generate_random_number(&info, &env, b"contract");
 
     // 比较结果
     let mut response = Response::new();
