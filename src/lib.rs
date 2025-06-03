@@ -55,8 +55,9 @@ pub fn instantiate(
 #[entry_point]
 pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> StdResult<Response> {
     match msg {
-        ExecuteMsg::Play {} => play_game(deps, env, info),
+        ExecuteMsg::PlayWar {} => play_war(deps, env, info),
         ExecuteMsg::PlaySlot {} => play_slot(deps, env, info),
+        ExecuteMsg::GuessNumber { guess } => play_guess_number(deps, env, info, guess),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -79,7 +80,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
 /// 比大小游戏
 ///
 /// 用户和合约进行比大小游戏, 用户生成的数字大于合约生成的数字，则用户获胜，获得下注金额 ×2 的奖励.
-fn play_game(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
+fn play_war(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
     // 检查用户是否发送了正确金额
     let sent_amount = info
         .funds
@@ -105,7 +106,7 @@ fn play_game(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
 
     // 比较结果
     let mut response = Response::new();
-    let mut user_win = "lost";
+    let mut result = "lost";
     if user_rand > contract_rand {
         // 用户赢：发送奖励（下注金额 ×2）
         let payout = Coin {
@@ -117,7 +118,7 @@ fn play_game(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
             amount: vec![payout],
         });
         state.locked_amount -= sent_amount * 2;
-        user_win = "win"
+        result = "win"
     } else if user_rand == contract_rand {
         // 平局：退还下注
         let refund = Coin {
@@ -129,7 +130,7 @@ fn play_game(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
             amount: vec![refund],
         });
         state.locked_amount -= sent_amount;
-        user_win = "tie"
+        result = "tie"
     }
 
     // 更新锁仓金额
@@ -137,11 +138,10 @@ fn play_game(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
     STATE.save(deps.storage, &state)?;
 
     Ok(response
-        .add_attribute(
-            "result",
-            format!("user:{}, contract:{}", user_rand, contract_rand),
-        )
-        .add_attribute("user_win", user_win))
+        .add_attribute("action", "play_war")
+        .add_attribute("user_rand", user_rand.to_string())
+        .add_attribute("contract_rand", contract_rand.to_string())
+        .add_attribute("result", result))
 }
 
 /// 老虎机游戏
@@ -222,6 +222,73 @@ fn play_slot(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
     Ok(response)
 }
 
+/// 猜数字游戏(范围 1 ～ 10)
+///
+/// 合约生成一个随机数，如果用户猜对，获得奖励。(完全猜中 x10、相邻 x1）
+pub fn play_guess_number(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    user_guess: u8,
+) -> StdResult<Response> {
+    if user_guess < 1 || user_guess > 10 {
+        return Err(StdError::generic_err("Guess must be between 1 and 10"));
+    }
+
+    let sent_amount = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if sent_amount < 100_000 || sent_amount > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += sent_amount;
+
+    // 生成合约伪随机数 1~10
+    let rand = utils::generate_random_number(&info, &env, b"guess") % 10 + 1;
+
+    let mut payout = 0;
+    let mut result = "lost";
+
+    if user_guess as u32 == rand {
+        payout = sent_amount * 10;
+        result = "exact";
+    } else if (user_guess as i32 - rand as i32).abs() == 1 {
+        payout = sent_amount * 1;
+        result = "adjacent";
+    }
+
+    let mut response = Response::new();
+
+    if payout > 0 {
+        response = response.add_message(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![Coin {
+                denom: "uatom".to_string(),
+                amount: Uint128::from(payout),
+            }],
+        });
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout);
+    }
+
+    STATE.save(deps.storage, &state)?;
+
+    Ok(response
+        .add_attribute("action", "play_guess_number")
+        .add_attribute("user_guess", user_guess.to_string())
+        .add_attribute("correct_number", rand.to_string())
+        .add_attribute("result", result))
+}
+
 // 处理提款逻辑（仅限所有者）
 fn withdraw_funds(deps: DepsMut, info: MessageInfo, amount: u128) -> StdResult<Response> {
     // 提取的钱不少于 0 uatom
@@ -295,20 +362,25 @@ mod tests {
     }
 
     #[test]
-    pub fn test_play_game() {
+    pub fn test_play_war() {
         let mut deps = mock_dependencies();
         let msg = InstantiateMsg {};
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-        let res = play_game(
+        let res = play_war(
             deps.as_mut(),
             mock_env(),
             mock_info("user", &coins(100_000, "uatom")),
         )
         .unwrap();
-        println!("{:?}", res);
-        let user_win = &res.attributes[1].value;
-        if "win" == user_win {
+
+        let attrs = res.attributes;
+        let result = attrs
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        if "win" == result.value {
             assert_eq!(
                 res.messages[0].msg,
                 BankMsg::Send {
@@ -317,7 +389,7 @@ mod tests {
                 }
                 .into()
             );
-        } else if "tie" == user_win {
+        } else if "tie" == result.value {
             assert_eq!(
                 res.messages[0].msg,
                 BankMsg::Send {
@@ -344,9 +416,7 @@ mod tests {
         let user_info = mock_info("user", &coins(100_000, "uatom"));
         let env = mock_env();
         let res = play_slot(deps.as_mut(), env.clone(), user_info.clone()).unwrap();
-        
-        println!("{:?}", res);
-        
+
         // 检查返回的事件属性
         let attrs = res.attributes;
 
@@ -368,26 +438,94 @@ mod tests {
             "slot1: {}, slot2: {}, slot3: {}",
             slot1.value, slot2.value, slot3.value
         );
-        
+
         // 如果用户赢了或平局，应该包含 payout_multiplier，否则包含 result = lost
         let payout_attr = attrs.iter().find(|a| a.key == "payout_multiplier");
         let result_attr = attrs.iter().find(|a| a.key == "result");
 
         // 确保包含下注金额
-        let bet_attr = attrs.iter().find(|a| a.key == "bet_amount").expect("bet_amount missing");
+        let bet_attr = attrs
+            .iter()
+            .find(|a| a.key == "bet_amount")
+            .expect("bet_amount missing");
         assert_eq!(bet_attr.value, "100000");
-        
+
         // 至少应该有一个
         assert!(
             payout_attr.is_some() || result_attr.is_some(),
             "expected either payout_multiplier or result"
         );
 
-        // 可选：打印测试输出帮助调试
+        // 打印测试输出帮助调试
         if let Some(attr) = payout_attr {
             println!("User won with multiplier: {}", attr.value);
         } else if let Some(attr) = result_attr {
             println!("User lost: {}", attr.value);
+        }
+    }
+
+    #[test]
+    pub fn test_play_guess_number() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let res = play_guess_number(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(100_000, "uatom")),
+            9,
+        )
+        .unwrap();
+
+        println!("{:?}", res);
+        
+        let result = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        let user_guess = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "user_guess")
+            .expect("user_guess missing");
+
+        let contract_guess = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "correct_number")
+            .expect("contract_guess missing");
+
+        // 如果用户猜的数字和 contract 生成的随机数字相同，则用户获取 10 倍奖励.
+        if "exact" == result.value {
+            assert_eq!(user_guess.value, contract_guess.value);
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: "user".to_string(),
+                    amount: coins(100_000 * 10, "uatom")
+                }
+                .into()
+            )
+        } else if "adjacent" == result.value {
+            // 如果用户猜的数字和 contract 生成的随机数字相邻, 则用户获取 1 倍奖励
+            let user_guess_num = user_guess.value.parse::<i32>().unwrap();
+            let contract_guess_num = contract_guess.value.parse::<i32>().unwrap();
+            assert_eq!((user_guess_num - contract_guess_num).abs(), 1);
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: "user".to_string(),
+                    amount: coins(100_000 * 1, "uatom")
+                }
+                .into()
+            )
+        } else {
+            // 用户猜的数字与合约的数字既不相同也不相邻则不获取任何奖励.
+            assert_eq!(res.messages.len(), 0);
         }
     }
 

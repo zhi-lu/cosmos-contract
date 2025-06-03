@@ -8,9 +8,11 @@ pub struct InstantiateMsg {}
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMsg {
     // 比大小游戏
-    Play {},
+    PlayWar {},
     // 老虎机游戏
     PlaySlot {},
+    // 猜数字游戏
+    GuessNumber { guess: u8 },
     // 部署者提款
     Withdraw { amount: u128 },
 }
