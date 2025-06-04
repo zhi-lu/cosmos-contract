@@ -1,3 +1,4 @@
+use crate::blackjack::BlackjackAction;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,8 @@ pub enum ExecuteMsg {
     PlaySlot {},
     // 猜数字游戏
     GuessNumber { guess: u8 },
+    // 黑杰克游戏
+    PlayBlackjack { action: BlackjackAction },
     // 部署者提款
     Withdraw { amount: u128 },
 }

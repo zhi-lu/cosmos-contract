@@ -1,11 +1,13 @@
+mod blackjack;
 mod msg;
 mod slot;
 mod state;
 mod utils;
 
+use crate::blackjack::BlackjackAction;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::slot::Symbol;
-use crate::state::{LockedAmountResponse, State, STATE};
+use crate::state::{BlackjackState, LockedAmountResponse, State, BLACKJACK_STATE, STATE};
 use cosmwasm_std::{
     entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Response,
     StdError, StdResult, Uint128,
@@ -58,6 +60,11 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         ExecuteMsg::PlayWar {} => play_war(deps, env, info),
         ExecuteMsg::PlaySlot {} => play_slot(deps, env, info),
         ExecuteMsg::GuessNumber { guess } => play_guess_number(deps, env, info, guess),
+        ExecuteMsg::PlayBlackjack { action } => match action {
+            BlackjackAction::Start => play_blackjack_start(deps, env, info),
+            BlackjackAction::Hit => play_blackjack_hit(deps, env, info),
+            BlackjackAction::Stand => play_blackjack_stand(deps, env, info),
+        },
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -225,7 +232,7 @@ fn play_slot(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
 /// 猜数字游戏(范围 1 ～ 10)
 ///
 /// 合约生成一个随机数，如果用户猜对，获得奖励。(完全猜中 x10、相邻 x1）
-pub fn play_guess_number(
+fn play_guess_number(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
@@ -325,6 +332,174 @@ fn withdraw_funds(deps: DepsMut, info: MessageInfo, amount: u128) -> StdResult<R
         })
         .add_attribute("action", "withdraw")
         .add_attribute("amount", amount.to_string()))
+}
+
+/// 21 点游戏启动
+///
+/// 启动 21 点游戏, 用户下注金额必须介于 100,000 和 10,000,000 uatom 之间。
+fn play_blackjack_start(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
+    // 验证下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    let bet_amount = Uint128::from(bet);
+
+    // 生成 4 张初始牌: 2 张牌是用户的、2 张牌是庄家的
+    let user_card1 = utils::generate_random_number(&info, &env, b"user1") % 11 + 1;
+    let user_card2 = utils::generate_random_number(&info, &env, b"user2") % 11 + 1;
+    let dealer_card1 = utils::generate_random_number(&info, &env, b"dealer1") % 11 + 1;
+    let dealer_card2 = utils::generate_random_number(&info, &env, b"dealer2") % 11 + 1;
+
+    // 保存游戏状态
+    let state = BlackjackState {
+        user_cards: vec![user_card1, user_card2],
+        dealer_cards: vec![dealer_card1, dealer_card2],
+        bet: bet_amount,
+        finished: false,
+    };
+
+    BLACKJACK_STATE.save(deps.storage, &info.sender, &state)?;
+
+    // 更新合约全局锁仓
+    let mut global_state = STATE.load(deps.storage)?;
+    global_state.locked_amount += bet;
+    STATE.save(deps.storage, &global_state)?;
+
+    // 构造返回
+    Ok(Response::new()
+        .add_attribute("action", "play_blackjack_start")
+        .add_attribute("user_card1", user_card1.to_string())
+        .add_attribute("user_card2", user_card2.to_string())
+        .add_attribute("dealer_card1", "hide") // 庄家的起手牌进行 hide
+        .add_attribute("dealer_card2", dealer_card2.to_string()))
+}
+
+/// 21 点玩家要牌
+///
+/// 当用户不超过 21 点数时, 用户可以继续要牌, 否则用户无法再要牌.
+fn play_blackjack_hit(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
+    // 加载当前用户游戏状态
+    let mut state: BlackjackState = BLACKJACK_STATE.load(deps.storage, &info.sender)?;
+
+    if state.finished {
+        return Err(StdError::generic_err("Game already finished"));
+    }
+
+    // 检查用户当前点数是否已经达到或超过 21，防止继续要牌
+    let current_total: u32 = state.user_cards.iter().sum();
+    if current_total >= 21 {
+        return Err(StdError::generic_err(
+            "You cannot hit after reaching 21 points",
+        ));
+    }
+
+    // 发一张新牌
+    let new_card = utils::generate_random_number(&info, &env, b"hit_card") % 11 + 1;
+    state.user_cards.push(new_card);
+
+    // 更新状态
+    BLACKJACK_STATE.save(deps.storage, &info.sender, &state)?;
+
+    // 返回结果
+    Ok(Response::new()
+        .add_attribute("action", "blackjack_hit")
+        .add_attribute("new_card", new_card.to_string())
+        .add_attribute(
+            "current_total",
+            state.user_cards.iter().sum::<u32>().to_string(),
+        ))
+}
+
+/// 21 点玩家停牌
+///
+/// 当玩家开始停牌时, 庄家会根据实际情况进行要牌.
+fn play_blackjack_stand(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
+    let mut state = BLACKJACK_STATE.load(deps.storage, &info.sender)?;
+    if state.finished {
+        return Err(StdError::generic_err("Game already finished"));
+    }
+
+    let user_total: u32 = state.user_cards.iter().sum();
+    let mut dealer_total: u32 = state.dealer_cards.iter().sum();
+
+    // 如果玩家爆牌, 直接结束游戏.
+    if user_total > 21 {
+        state.finished = true;
+        BLACKJACK_STATE.save(deps.storage, &info.sender, &state)?;
+        return Ok(Response::new()
+            .add_attribute("action", "blackjack_stand")
+            .add_attribute("result", "player_busted")
+            .add_attribute("user_total", user_total.to_string())
+            .add_attribute("dealer_total", dealer_total.to_string()));
+    }
+
+    // 庄家的补充牌逻辑: 小于 17 点或者小于用户的牌必须需要牌.
+    while dealer_total < 17 || dealer_total < user_total {
+        let new_card = utils::generate_random_number(&info, &env, b"dealer_hit") % 11 + 1;
+        state.dealer_cards.push(new_card);
+        dealer_total += new_card;
+    }
+
+    // 判断胜负
+    let result: &str;
+    let payout: Uint128;
+
+    if dealer_total > 21 {
+        // 玩家赢了
+        result = "player_win";
+        payout = state.bet * Uint128::new(2);
+    } else if user_total < dealer_total {
+        // 玩家输了
+        result = "dealer_win";
+        payout = Uint128::zero();
+    } else {
+        // 平局，退还本金
+        result = "draw";
+        payout = state.bet;
+    }
+
+    // 更新 locked_amount 锁仓状态
+    let mut global_state = STATE.load(deps.storage)?;
+    global_state.locked_amount = global_state.locked_amount.saturating_sub(payout.u128());
+    STATE.save(deps.storage, &global_state)?;
+
+    // 结束游戏.
+    state.finished = true;
+    BLACKJACK_STATE.save(deps.storage, &info.sender, &state)?;
+
+    // 创建响应对象
+    let mut response = Response::new();
+
+    // 如果是平局或者玩家赢了, 发送支付金额给玩家
+    if payout != Uint128::zero() {
+        response = response.add_message(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![Coin {
+                denom: "uatom".to_string(),
+                amount: payout,
+            }],
+        });
+    }
+
+    // 返回结果
+    Ok(response
+        .add_attribute("action", "blackjack_stand")
+        .add_attribute("result", result)
+        .add_attribute("user_total", user_total.to_string())
+        .add_attribute("dealer_total", dealer_total.to_string())
+        .add_attribute("user_cards", format!("{:?}", state.user_cards))
+        .add_attribute("dealer_cards", format!("{:?}", state.dealer_cards))
+        .add_attribute("payout", payout.to_string()))
 }
 
 #[cfg(test)]
@@ -480,7 +655,7 @@ mod tests {
         .unwrap();
 
         println!("{:?}", res);
-        
+
         let result = res
             .attributes
             .iter()
