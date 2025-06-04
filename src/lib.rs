@@ -1,10 +1,12 @@
 mod blackjack;
+mod coin;
 mod msg;
 mod slot;
 mod state;
 mod utils;
 
 use crate::blackjack::BlackjackAction;
+use crate::coin::CoinSide;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::slot::Symbol;
 use crate::state::{
@@ -67,6 +69,7 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
             BlackjackAction::Hit => play_blackjack_hit(deps, env, info),
             BlackjackAction::Stand => play_blackjack_stand(deps, env, info),
         },
+        ExecuteMsg::PlayCoinFlip { choice } => play_coin_flip(deps, env, info, choice),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -519,6 +522,72 @@ fn play_blackjack_stand(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult
         .add_attribute("payout", payout.to_string()))
 }
 
+/// 玩硬币翻牌
+///
+/// 用户猜硬币的结果，如果猜对了，则获得 bet * 2 的金额，否则损失 bet 的金额。
+fn play_coin_flip(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    choice: CoinSide,
+) -> StdResult<Response> {
+    // 验证下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 修改锁仓 lock_amount
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+    STATE.save(deps.storage, &state)?;
+
+    // 抛硬币：0 -> Heads, 1 -> Tails
+    let rand = utils::generate_random_number(&info, &env, b"coin_flip") % 2;
+    let result = if rand == 0 {
+        CoinSide::Heads
+    } else {
+        CoinSide::Tails
+    };
+
+    let mut response = Response::new()
+        .add_attribute("action", "coin_flip")
+        .add_attribute("player_choice", format!("{:?}", choice))
+        .add_attribute("actual_result", format!("{:?}", result));
+
+    if choice == result {
+        // 赢了，奖励翻倍
+        let payout = Uint128::from(bet) * Uint128::new(2);
+        state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
+        STATE.save(deps.storage, &state)?;
+
+        response = response
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: payout,
+                }],
+            })
+            .add_attribute("result", "win")
+            .add_attribute("payout", payout.to_string());
+    } else {
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    }
+
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,25 +681,6 @@ mod tests {
         // 检查返回的事件属性
         let attrs = res.attributes;
 
-        let slot1 = attrs
-            .iter()
-            .find(|a| a.key == "slot1")
-            .expect("slot1 missing");
-        let slot2 = attrs
-            .iter()
-            .find(|a| a.key == "slot2")
-            .expect("slot2 missing");
-        let slot3 = attrs
-            .iter()
-            .find(|a| a.key == "slot3")
-            .expect("slot3 missing");
-
-        // 输出调试信息（可选）
-        println!(
-            "slot1: {}, slot2: {}, slot3: {}",
-            slot1.value, slot2.value, slot3.value
-        );
-
         // 如果用户赢了或平局，应该包含 payout_multiplier，否则包含 result = lost
         let payout_attr = attrs.iter().find(|a| a.key == "payout_multiplier");
         let result_attr = attrs.iter().find(|a| a.key == "result");
@@ -647,13 +697,6 @@ mod tests {
             payout_attr.is_some() || result_attr.is_some(),
             "expected either payout_multiplier or result"
         );
-
-        // 打印测试输出帮助调试
-        if let Some(attr) = payout_attr {
-            println!("User won with multiplier: {}", attr.value);
-        } else if let Some(attr) = result_attr {
-            println!("User lost: {}", attr.value);
-        }
     }
 
     #[test]
@@ -670,8 +713,6 @@ mod tests {
             9,
         )
         .unwrap();
-
-        println!("{:?}", res);
 
         let result = res
             .attributes
@@ -809,15 +850,6 @@ mod tests {
         let res = execute(deps.as_mut(), mock_env(), info.clone(), stand_msg).unwrap();
         assert_eq!(res.attributes[0], attr("action", "blackjack_stand"));
 
-        // 检查是否有结果字段
-        let result_attr = res
-            .attributes
-            .iter()
-            .find(|a| a.key == "result")
-            .expect("Should contain result attribute");
-
-        println!("Blackjack result: {:?}", result_attr.value);
-
         query_msg = QueryMsg::GetBlackjackState {
             address: player.to_string(),
         };
@@ -862,5 +894,44 @@ mod tests {
         assert_eq!(resp.dealer_cards[0], 0); // 未完成游戏，庄家第一张牌被隐藏
         assert_eq!(resp.bet, Uint128::new(1_000_000));
         assert_eq!(resp.finished, false);
+    }
+
+    #[test]
+    fn test_play_coin_flip() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约
+        let instantiate_msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
+
+        // 模拟用户参与 coin_flip 游戏
+        let user = "player1";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let coin_flip = ExecuteMsg::PlayCoinFlip {
+            choice: CoinSide::Heads,
+        };
+
+        let res = execute(deps.as_mut(), mock_env(), user_info.clone(), coin_flip).unwrap();
+
+        let result = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        if "win" == result.value {
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(2_000_000, "uatom")
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
     }
 }
