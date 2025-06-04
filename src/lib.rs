@@ -7,7 +7,9 @@ mod utils;
 use crate::blackjack::BlackjackAction;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::slot::Symbol;
-use crate::state::{BlackjackState, LockedAmountResponse, State, BLACKJACK_STATE, STATE};
+use crate::state::{
+    BlackjackState, BlackjackStateResponse, LockedAmountResponse, State, BLACKJACK_STATE, STATE,
+};
 use cosmwasm_std::{
     entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Response,
     StdError, StdResult, Uint128,
@@ -78,6 +80,21 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             let state = STATE.load(deps.storage)?;
             let resp = LockedAmountResponse {
                 locked_amount: Uint128::from(state.locked_amount),
+            };
+            to_json_binary(&resp)
+        }
+        QueryMsg::GetBlackjackState { address } => {
+            let addr = deps.api.addr_validate(&address);
+            let state = BLACKJACK_STATE.load(deps.storage, &addr.unwrap())?;
+            let mut hide_dealer_cards = state.dealer_cards;
+            if !state.finished {
+                hide_dealer_cards[0] = 0;
+            }
+            let resp = BlackjackStateResponse {
+                user_cards: state.user_cards,
+                dealer_cards: hide_dealer_cards,
+                bet: state.bet,
+                finished: state.finished,
             };
             to_json_binary(&resp)
         }
@@ -355,10 +372,10 @@ fn play_blackjack_start(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult
     let bet_amount = Uint128::from(bet);
 
     // 生成 4 张初始牌: 2 张牌是用户的、2 张牌是庄家的
-    let user_card1 = utils::generate_random_number(&info, &env, b"user1") % 11 + 1;
-    let user_card2 = utils::generate_random_number(&info, &env, b"user2") % 11 + 1;
-    let dealer_card1 = utils::generate_random_number(&info, &env, b"dealer1") % 11 + 1;
-    let dealer_card2 = utils::generate_random_number(&info, &env, b"dealer2") % 11 + 1;
+    let user_card1 = utils::generate_random_number(&info, &env, b"user1") % 10 + 1;
+    let user_card2 = utils::generate_random_number(&info, &env, b"user2") % 10 + 1;
+    let dealer_card1 = utils::generate_random_number(&info, &env, b"dealer1") % 10 + 1;
+    let dealer_card2 = utils::generate_random_number(&info, &env, b"dealer2") % 10 + 1;
 
     // 保存游戏状态
     let state = BlackjackState {
@@ -396,7 +413,7 @@ fn play_blackjack_hit(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<R
     }
 
     // 检查用户当前点数是否已经达到或超过 21，防止继续要牌
-    let current_total: u32 = state.user_cards.iter().sum();
+    let current_total: u32 = utils::calculate_blackjack_total(&state.user_cards);
     if current_total >= 21 {
         return Err(StdError::generic_err(
             "You cannot hit after reaching 21 points",
@@ -404,7 +421,7 @@ fn play_blackjack_hit(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<R
     }
 
     // 发一张新牌
-    let new_card = utils::generate_random_number(&info, &env, b"hit_card") % 11 + 1;
+    let new_card = utils::generate_random_number(&info, &env, b"hit_card") % 10 + 1;
     state.user_cards.push(new_card);
 
     // 更新状态
@@ -416,7 +433,7 @@ fn play_blackjack_hit(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<R
         .add_attribute("new_card", new_card.to_string())
         .add_attribute(
             "current_total",
-            state.user_cards.iter().sum::<u32>().to_string(),
+            utils::calculate_blackjack_total(&state.user_cards).to_string(),
         ))
 }
 
@@ -429,8 +446,8 @@ fn play_blackjack_stand(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult
         return Err(StdError::generic_err("Game already finished"));
     }
 
-    let user_total: u32 = state.user_cards.iter().sum();
-    let mut dealer_total: u32 = state.dealer_cards.iter().sum();
+    let user_total: u32 = utils::calculate_blackjack_total(&state.user_cards);
+    let mut dealer_total: u32 = utils::calculate_blackjack_total(&state.dealer_cards);
 
     // 如果玩家爆牌, 直接结束游戏.
     if user_total > 21 {
@@ -445,9 +462,9 @@ fn play_blackjack_stand(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult
 
     // 庄家的补充牌逻辑: 小于 17 点或者小于用户的牌必须需要牌.
     while dealer_total < 17 || dealer_total < user_total {
-        let new_card = utils::generate_random_number(&info, &env, b"dealer_hit") % 11 + 1;
+        let new_card = utils::generate_random_number(&info, &env, b"dealer_hit") % 10 + 1;
         state.dealer_cards.push(new_card);
-        dealer_total += new_card;
+        dealer_total = utils::calculate_blackjack_total(&state.dealer_cards);
     }
 
     // 判断胜负
@@ -506,7 +523,7 @@ fn play_blackjack_stand(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult
 mod tests {
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-    use cosmwasm_std::{coins, from_json};
+    use cosmwasm_std::{attr, coins, from_json};
 
     #[test]
     pub fn test_init() {
@@ -720,5 +737,130 @@ mod tests {
             }
             .into()
         );
+    }
+
+    #[test]
+    fn test_blackjack_full_flow() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约
+        let instantiate_msg = InstantiateMsg {};
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, instantiate_msg).unwrap();
+
+        let player = "player1";
+
+        // ----------------------------
+        // Step 1: Start 游戏
+        // ----------------------------
+        let start_msg = ExecuteMsg::PlayBlackjack {
+            action: BlackjackAction::Start,
+        };
+        let info = mock_info(player, &coins(500_000, "uatom")); // 有效下注金额
+        let res = execute(deps.as_mut(), mock_env(), info.clone(), start_msg).unwrap();
+        assert_eq!(res.attributes[0], attr("action", "play_blackjack_start"));
+
+        let mut query_msg = QueryMsg::GetBlackjackState {
+            address: player.to_string(),
+        };
+
+        let mut bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let mut resp: BlackjackStateResponse = from_json(&bin).unwrap();
+
+        let user_total_by_resp: u32 = utils::calculate_blackjack_total(&resp.user_cards);
+        let user_card1 = &res
+            .attributes
+            .iter()
+            .find(|a| a.key == "user_card1")
+            .unwrap()
+            .value;
+        let user_card2 = &res
+            .attributes
+            .iter()
+            .find(|a| a.key == "user_card2")
+            .unwrap()
+            .value;
+        let user_total_by_attr: u32 = utils::calculate_blackjack_total(&*vec![
+            user_card1.parse::<u32>().unwrap(),
+            user_card2.parse::<u32>().unwrap(),
+        ]);
+        assert_eq!(user_total_by_resp, user_total_by_attr);
+
+        // ----------------------------
+        // Step 2: 当用户的牌小于 17 点, Hit 要一张牌
+        // ----------------------------
+
+        if user_total_by_attr < 17 {
+            let hit_msg = ExecuteMsg::PlayBlackjack {
+                action: BlackjackAction::Hit,
+            };
+
+            let res = execute(deps.as_mut(), mock_env(), info.clone(), hit_msg).unwrap();
+
+            assert_eq!(res.attributes[0], attr("action", "blackjack_hit"));
+        }
+
+        // ----------------------------
+        // Step 3: Stand 停牌
+        // ----------------------------
+        let stand_msg = ExecuteMsg::PlayBlackjack {
+            action: BlackjackAction::Stand,
+        };
+        let res = execute(deps.as_mut(), mock_env(), info.clone(), stand_msg).unwrap();
+        assert_eq!(res.attributes[0], attr("action", "blackjack_stand"));
+
+        // 检查是否有结果字段
+        let result_attr = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("Should contain result attribute");
+
+        println!("Blackjack result: {:?}", result_attr.value);
+
+        query_msg = QueryMsg::GetBlackjackState {
+            address: player.to_string(),
+        };
+        bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        resp = from_json(&bin).unwrap();
+
+        assert!(resp.finished);
+        assert!(!resp.user_cards.is_empty());
+        assert!(!resp.dealer_cards.is_empty());
+    }
+
+    #[test]
+    fn test_blackjack_query_state() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约
+        let instantiate_msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
+
+        // 模拟用户参与 Blackjack 游戏
+        let user = "player1";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let start_msg = ExecuteMsg::PlayBlackjack {
+            action: BlackjackAction::Start,
+        };
+
+        let _res = execute(deps.as_mut(), mock_env(), user_info.clone(), start_msg).unwrap();
+
+        // 查询 Blackjack 状态
+        let query_msg = QueryMsg::GetBlackjackState {
+            address: user.to_string(),
+        };
+
+        let bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let resp: BlackjackStateResponse = from_json(&bin).unwrap();
+
+        // 验证结构内容
+        assert_eq!(resp.user_cards.len(), 2);
+        assert_eq!(resp.dealer_cards.len(), 2);
+        assert_eq!(resp.dealer_cards[0], 0); // 未完成游戏，庄家第一张牌被隐藏
+        assert_eq!(resp.bet, Uint128::new(1_000_000));
+        assert_eq!(resp.finished, false);
     }
 }

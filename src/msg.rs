@@ -23,5 +23,9 @@ pub enum ExecuteMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMsg {
+    // 查询当前合约的锁仓金额
     GetLockedAmount {},
+    
+    // 查询某用户当前 Blackjack 游戏状态
+    GetBlackjackState { address: String },
 }
