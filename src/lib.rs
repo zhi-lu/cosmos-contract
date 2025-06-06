@@ -90,6 +90,7 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
                 play_dice_range_bet(deps, env, info, start, end)
             }
         },
+        ExecuteMsg::PlayLuckyWheel {} => play_lucky_wheel(deps, env, info),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -801,6 +802,58 @@ fn play_dice_range_bet(
         .add_attribute("player_end", end.to_string()))
 }
 
+fn play_lucky_wheel(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 奖励倍数配置
+    let multipliers = [0, 2, 5, 10, 0, 3, 0, 1];
+
+    // 加入奖池锁仓
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+    STATE.save(deps.storage, &state)?;
+
+    // 生成 0~7 的随机索引
+    let index = (utils::generate_random_number(&info, &env, b"lucky_wheel") % 8) as usize;
+    let multiplier = multipliers[index];
+    let mut response = Response::new()
+        .add_attribute("action", "play_lucky_wheel")
+        .add_attribute("index", index.to_string())
+        .add_attribute("multiplier", multiplier.to_string());
+
+    if multiplier > 0 {
+        let payout = Uint128::from(bet) * Uint128::new(multiplier as u128);
+        state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
+        STATE.save(deps.storage, &state)?;
+
+        response = response
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: payout,
+                }],
+            })
+            .add_attribute("result", "win")
+            .add_attribute("payout", payout.to_string());
+    } else {
+        response = response.add_attribute("result", "lose");
+    }
+
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,16 +1333,68 @@ mod tests {
             .iter()
             .find(|a| a.key == "player_end")
             .expect("player_end missing");
-        
+
         if result.value == "win" {
             let actual_result_int = actual_result.value.parse::<u32>().unwrap();
-            assert_eq!(true, actual_result_int >= player_start.value.parse::<u32>().unwrap());
-            assert_eq!(true, actual_result_int <= player_end.value.parse::<u32>().unwrap());
-            assert_eq!(res.messages[0].msg,  BankMsg::Send {
-                to_address: user.to_string(),
-                amount: coins(2_000_000, "uatom")
-            }.into())
-        } else { 
+            assert_eq!(
+                true,
+                actual_result_int >= player_start.value.parse::<u32>().unwrap()
+            );
+            assert_eq!(
+                true,
+                actual_result_int <= player_end.value.parse::<u32>().unwrap()
+            );
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(2_000_000, "uatom")
+                }
+                .into()
+            )
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_lucky_wheel() {
+        let mut deps = mock_dependencies();
+        let instantiate_msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
+        let user = "player1";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+        let lucky_wheel = ExecuteMsg::PlayLuckyWheel {};
+        let res = execute(deps.as_mut(), mock_env(), user_info.clone(), lucky_wheel).unwrap();
+
+        println!("{:?}", res);
+        
+        let result = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        let multiplier = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "multiplier")
+            .expect("multiplier missing");
+
+        if result.value == "win" {
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(
+                        (1_000_000 * multiplier.value.parse::<u64>().unwrap()) as u128,
+                        "uatom"
+                    )
+                }
+                .into()
+            );
+        } else {
             assert_eq!(res.messages.len(), 0);
         }
     }

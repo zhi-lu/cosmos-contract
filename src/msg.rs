@@ -22,6 +22,8 @@ pub enum ExecuteMsg {
     PlayCoinFlip { choice: CoinSide },
     // 骰子游戏
     PlayDice { mode: DiceGameMode },
+    // 幸运转盘
+    PlayLuckyWheel {},
     // 部署者提款
     Withdraw { amount: u128 },
 }
