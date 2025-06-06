@@ -2,6 +2,7 @@ use crate::blackjack::BlackjackAction;
 use crate::coin::CoinSide;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use crate::dice::DiceGameMode;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct InstantiateMsg {}
@@ -19,6 +20,8 @@ pub enum ExecuteMsg {
     PlayBlackjack { action: BlackjackAction },
     // 硬币翻转游戏
     PlayCoinFlip { choice: CoinSide },
+    // 骰子游戏
+    PlayDice { mode: DiceGameMode },
     // 部署者提款
     Withdraw { amount: u128 },
 }

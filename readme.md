@@ -38,7 +38,7 @@ curl https://${IP}:${REST_PORT}/cosmos/tx/v1beta1/txs/${tx_hash}
 3. 猜数字游戏(guess number)
 4. 21 点游戏简易版(Mini Blackjack)
 5. 硬币抛掷(Coin Flip)
+6. 骰子对赌(Dice Roll Duel)
 
 ## 下一步支持的游戏
-1. 骰子对赌(Dice Roll Duel)
-2. 幸运转盘(Lucky Wheel)
+1. 幸运转盘(Lucky Wheel)
