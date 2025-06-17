@@ -18,7 +18,7 @@ pub struct BlackjackState {
 }
 
 // 目前将 21 点返回的 Response 设置为 BlackjackState 类型.
-pub(crate) type BlackjackStateResponse = BlackjackState;
+pub type BlackjackStateResponse = BlackjackState;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LockedAmountResponse {
