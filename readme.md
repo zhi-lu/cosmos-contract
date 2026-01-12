@@ -41,6 +41,7 @@ curl https://${IP}:${REST_PORT}/cosmos/tx/v1beta1/txs/${tx_hash}
 | 硬币抛掷   | Coin Flip         | 正反面猜测游戏   / Heads and tails guessing game      |
 | 骰子对赌   | Dice Roll Duel    | 骰子对战游戏     / Dice Battle Game                  |
 | 幸运转盘   | Lucky Wheel       | 轮盘抽奖游戏     / Roulette Game                     |
+| 百家乐    | Baccarat          | 简单的百家乐游戏    / Simplified Baccarat Game         |
 
 ## 使用说明 / Usage Notes
 

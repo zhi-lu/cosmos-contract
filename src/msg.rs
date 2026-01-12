@@ -1,5 +1,7 @@
+use crate::baccarat::BaccaratBet;
 use crate::blackjack::BlackjackAction;
 use crate::coin::CoinSide;
+use crate::roulette::RouletteBetType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use crate::dice::DiceGameMode;
@@ -22,8 +24,10 @@ pub enum ExecuteMsg {
     PlayCoinFlip { choice: CoinSide },
     // 骰子游戏
     PlayDice { mode: DiceGameMode },
-    // 幸运转盘
-    PlayLuckyWheel {},
+    // 百家乐游戏
+    PlayBaccarat { bet_choice: BaccaratBet },
+    // 轮盘游戏
+    PlayRoulette { bet_type: RouletteBetType },
     // 部署者提款
     Withdraw { amount: u128 },
 }

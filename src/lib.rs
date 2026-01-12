@@ -1,15 +1,19 @@
+mod baccarat;
 mod blackjack;
 mod coin;
 mod dice;
 mod msg;
+mod roulette;
 mod slot;
 mod state;
 mod utils;
 
+use crate::baccarat::BaccaratBet;
 use crate::blackjack::BlackjackAction;
 use crate::coin::CoinSide;
 use crate::dice::{DiceGameMode, DiceGuessSize};
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::roulette::{Color, EvenOdd, HighLow, RouletteBetType, RouletteResult};
 use crate::slot::Symbol;
 use crate::state::{
     BlackjackState, BlackjackStateResponse, LockedAmountResponse, State, BLACKJACK_STATE, STATE,
@@ -90,7 +94,8 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
                 play_dice_range_bet(deps, env, info, start, end)
             }
         },
-        ExecuteMsg::PlayLuckyWheel {} => play_lucky_wheel(deps, env, info),
+        ExecuteMsg::PlayBaccarat { bet_choice } => play_baccarat(deps, env, info, bet_choice),
+        ExecuteMsg::PlayRoulette { bet_type } => play_roulette(deps, env, info, bet_type),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -802,7 +807,16 @@ fn play_dice_range_bet(
         .add_attribute("player_end", end.to_string()))
 }
 
-fn play_lucky_wheel(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
+/// 百家乐游戏
+///
+/// 玩家可以在庄家、闲家或平局中选择下注
+fn play_baccarat(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    bet_choice: BaccaratBet,
+) -> StdResult<Response> {
+    // 检查下注金额
     let bet = info
         .funds
         .iter()
@@ -816,42 +830,279 @@ fn play_lucky_wheel(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Res
         ));
     }
 
-    // 奖励倍数配置
-    let multipliers = [0, 2, 5, 10, 0, 3, 0, 1];
-
-    // 加入奖池锁仓
+    // 更新合约锁仓金额
     let mut state = STATE.load(deps.storage)?;
     state.locked_amount += bet;
     STATE.save(deps.storage, &state)?;
 
-    // 生成 0~7 的随机索引
-    let index = (utils::generate_random_number(&info, &env, b"lucky_wheel") % 8) as usize;
-    let multiplier = multipliers[index];
-    let mut response = Response::new()
-        .add_attribute("action", "play_lucky_wheel")
-        .add_attribute("index", index.to_string())
-        .add_attribute("multiplier", multiplier.to_string());
+    // 发牌 - 百家乐规则：每人先发两张牌
+    let mut player_cards = vec![
+        (utils::generate_random_number(&info, &env, b"player1") % 10) as u8,
+        (utils::generate_random_number(&info, &env, b"player2") % 10) as u8,
+    ];
 
-    if multiplier > 0 {
-        let payout = Uint128::from(bet) * Uint128::new(multiplier as u128);
-        state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
-        STATE.save(deps.storage, &state)?;
+    let mut banker_cards = vec![
+        (utils::generate_random_number(&info, &env, b"banker1") % 10) as u8,
+        (utils::generate_random_number(&info, &env, b"banker2") % 10) as u8,
+    ];
+
+    // 计算点数（百家乐中只有个位数有效）
+    let mut player_total = (player_cards[0] + player_cards[1]) % 10;
+    let mut banker_total = (banker_cards[0] + banker_cards[1]) % 10;
+
+    // 根据规则决定是否补牌
+    let player_third_card = if player_total <= 5 {
+        let third_card = (utils::generate_random_number(&info, &env, b"player3") % 10) as u8;
+        player_cards.push(third_card);
+        player_total = (player_total + third_card) % 10;
+        Some(third_card)
+    } else {
+        None
+    };
+
+    // 庄家是否补牌取决于闲家是否补牌以及当前点数
+    if banker_total <= 5 {
+        let should_draw = match player_third_card {
+            Some(third_card) => {
+                // 根据百家乐规则确定庄家是否补牌
+                match banker_total {
+                    0..=2 => true,                                    // 庄家0-2点必补牌
+                    3 => third_card != 8, // 庄家3点，闲家第三张为8时不补牌
+                    4 => matches!(third_card, 2 | 3 | 4 | 5 | 6 | 7), // 庄家4点规则
+                    5 => matches!(third_card, 4 | 5 | 6 | 7), // 庄家5点规则
+                    6 => matches!(third_card, 6 | 7), // 庄家6点规则
+                    _ => false,           // 庄家7点以上不补牌
+                }
+            }
+            None => banker_total <= 5, // 如果闲家没补牌，庄家按基本规则补牌
+        };
+
+        if should_draw {
+            let third_card = (utils::generate_random_number(&info, &env, b"banker3") % 10) as u8;
+            banker_cards.push(third_card);
+            banker_total = (banker_total + third_card) % 10;
+        }
+    }
+
+    // 确定赢家
+    let winner = if player_total > banker_total {
+        BaccaratBet::Player
+    } else if banker_total > player_total {
+        BaccaratBet::Banker
+    } else {
+        BaccaratBet::Tie
+    };
+
+    // 计算赔付
+    let (payout_multiplier, commission) = match winner {
+        BaccaratBet::Player => (2, 0), // 1:1 赔付，无佣金
+        BaccaratBet::Banker => (2, 5), // 1:1 赔付，但收取5%佣金
+        BaccaratBet::Tie => (9, 0),    // 8:1 赔付 (我们设置为9倍因为包含本金)
+    };
+
+    let mut response = Response::new()
+        .add_attribute("action", "play_baccarat")
+        .add_attribute("player_cards", format!("{:?}", player_cards))
+        .add_attribute("banker_cards", format!("{:?}", banker_cards))
+        .add_attribute("player_total", player_total.to_string())
+        .add_attribute("banker_total", banker_total.to_string())
+        .add_attribute("player_bet", format!("{:?}", bet_choice))
+        .add_attribute("winner", format!("{:?}", winner));
+
+    // 如果玩家猜中了结果
+    if winner == bet_choice {
+        let mut winnings = bet * (payout_multiplier as u128 - 1); // 奖金不包括本金
+
+        // 如果投注庄家且获胜，扣除佣金
+        if winner == BaccaratBet::Banker {
+            let commission_amount = winnings * commission / 100;
+            winnings = winnings.saturating_sub(commission_amount);
+        }
+
+        // 特殊处理平局情况
+        if winner == BaccaratBet::Tie {
+            winnings = bet * 8; // 8倍奖金
+        }
+
+        let payout_amount = bet + winnings; // 本金+奖金
+        let payout = Coin {
+            denom: "uatom".to_string(),
+            amount: Uint128::from(payout_amount),
+        };
 
         response = response
             .add_message(BankMsg::Send {
                 to_address: info.sender.to_string(),
-                amount: vec![Coin {
-                    denom: "uatom".to_string(),
-                    amount: payout,
-                }],
+                amount: vec![payout],
             })
             .add_attribute("result", "win")
-            .add_attribute("payout", payout.to_string());
+            .add_attribute("winnings", winnings.to_string())
+            .add_attribute("payout", payout_amount.to_string());
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout_amount);
+        STATE.save(deps.storage, &state)?;
     } else {
-        response = response.add_attribute("result", "lose");
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
     }
 
     Ok(response)
+}
+
+/// 轮盘游戏
+///
+/// 轮盘包含数字 0-36，其中：
+/// - 0 用于显示颜色但不参与颜色押注
+/// - 仅保留四种玩法：单个数字、颜色、奇偶、大小
+fn play_roulette(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    bet_type: RouletteBetType,
+) -> StdResult<Response> {
+    // 检查下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 更新合约锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+    STATE.save(deps.storage, &state)?;
+
+    // 生成 0-36 的随机数作为轮盘结果
+    let winning_number = (utils::generate_random_number(&info, &env, b"roulette") % 37) as u8;
+
+    // 根据轮盘规则确定颜色
+    let winning_color = get_roulette_color(winning_number);
+
+    // 判断是否为偶数
+    let is_even = winning_number != 0 && winning_number % 2 == 0;
+
+    // 判断大小（0 不属于任何一类）
+    let is_low = if winning_number == 0 {
+        None
+    } else if winning_number <= 18 {
+        Some(true) // Low (1-18)
+    } else {
+        Some(false) // High (19-36)
+    };
+
+    // 创建结果对象
+    let result = RouletteResult {
+        winning_number,
+        winning_color: winning_color.clone(),
+        is_even,
+        is_low,
+    };
+
+    // 计算赔付
+    let (won, payout_multiplier) = calculate_roulette_payout(&bet_type, &result);
+
+    let mut response = Response::new()
+        .add_attribute("action", "play_roulette")
+        .add_attribute("winning_number", winning_number.to_string())
+        .add_attribute("winning_color", format!("{:?}", winning_color))
+        .add_attribute("is_even", is_even.to_string())
+        .add_attribute("bet_type", format!("{:?}", bet_type));
+
+    if won {
+        let winnings = bet * payout_multiplier;
+        let payout = Coin {
+            denom: "uatom".to_string(),
+            amount: Uint128::from(winnings),
+        };
+
+        response = response
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![payout],
+            })
+            .add_attribute("result", "win")
+            .add_attribute("winnings", winnings.to_string());
+
+        state.locked_amount = state.locked_amount.saturating_sub(winnings);
+        STATE.save(deps.storage, &state)?;
+    } else {
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    }
+
+    Ok(response)
+}
+
+/// 获取轮盘数字的颜色
+fn get_roulette_color(number: u8) -> Color {
+    if number == 0 {
+        // 0 仅用于显示为绿色/特殊色，颜色押注不生效
+        Color::Black // 若 Color 枚举无绿色，保持显示但不允许颜色押注中奖
+    } else {
+        // 轮盘红色数字: 1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36
+        match number {
+            1 | 3 | 5 | 7 | 9 | 12 | 14 | 16 | 18 | 19 | 21 | 23 | 25 | 27 | 30 | 32 | 34 | 36 => {
+                Color::Red
+            }
+            _ => Color::Black, // 其余为黑色
+        }
+    }
+}
+
+/// 计算轮盘游戏的赔付
+fn calculate_roulette_payout(bet_type: &RouletteBetType, result: &RouletteResult) -> (bool, u128) {
+    match bet_type {
+        // 单个数字下注，赔率 35:1
+        RouletteBetType::SingleNumber { number } => {
+            if *number == result.winning_number {
+                (true, 36) // 包含本金的总倍数
+            } else {
+                (false, 0)
+            }
+        }
+        // 颜色下注，赔率 1:1；开出 0 时颜色押注必输
+        RouletteBetType::Color { color } => {
+            if result.winning_number != 0 && *color == result.winning_color {
+                (true, 2)
+            } else {
+                (false, 0)
+            }
+        }
+        // 奇偶下注，赔率 1:1
+        RouletteBetType::EvenOdd { bet } => {
+            // 0 既不是奇数也不是偶数，投注奇偶都不会中奖
+            if result.winning_number == 0 {
+                (false, 0)
+            } else {
+                match bet {
+                    EvenOdd::Even => (result.is_even, 2), // 包含本金的总倍数
+                    EvenOdd::Odd => (!result.is_even, 2), // 包含本金的总倍数
+                }
+            }
+        }
+
+        // 大小下注（1-18 / 19-36），赔率 1:1
+        RouletteBetType::HighLow { bet } => {
+            if let Some(is_low) = result.is_low {
+                match bet {
+                    HighLow::Low => (is_low, 2),   // 包含本金的总倍数
+                    HighLow::High => (!is_low, 2), // 包含本金的总倍数
+                }
+            } else {
+                // 如果是0，大小投注都不中奖
+                (false, 0)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1358,39 +1609,123 @@ mod tests {
     }
 
     #[test]
-    fn test_play_lucky_wheel() {
+    fn test_play_baccarat() {
         let mut deps = mock_dependencies();
         let instantiate_msg = InstantiateMsg {};
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
         let user = "player1";
+
+        // 测试玩家获胜情况
         let user_info = mock_info(user, &coins(1_000_000, "uatom"));
-        let lucky_wheel = ExecuteMsg::PlayLuckyWheel {};
-        let res = execute(deps.as_mut(), mock_env(), user_info.clone(), lucky_wheel).unwrap();
+        let baccarat_game = ExecuteMsg::PlayBaccarat {
+            bet_choice: BaccaratBet::Player,
+        };
+        let res = execute(deps.as_mut(), mock_env(), user_info.clone(), baccarat_game).unwrap();
 
         println!("{:?}", res);
-        
+
         let result = res
             .attributes
             .iter()
             .find(|a| a.key == "result")
             .expect("result missing");
 
-        let multiplier = res
+        let winner = res
             .attributes
             .iter()
-            .find(|a| a.key == "multiplier")
-            .expect("multiplier missing");
+            .find(|a| a.key == "winner")
+            .expect("winner missing");
 
         if result.value == "win" {
+            // 如果玩家获胜，检查是否正确赔付 (1:1 奖金 + 1:1 本金 = 2倍)
+            if winner.value == "Player" {
+                assert_eq!(
+                    res.messages[0].msg,
+                    BankMsg::Send {
+                        to_address: user.to_string(),
+                        amount: coins(2_000_000, "uatom")
+                    }
+                    .into()
+                );
+            } else if winner.value == "Banker" {
+                // 庄家获胜但是用户押注错了
+                assert_eq!(res.messages.len(), 0);
+            } else {
+                // 平局，赔率更高 (8:1 奖金 + 1:1 本金 = 9倍)
+                assert_eq!(
+                    res.messages[0].msg,
+                    BankMsg::Send {
+                        to_address: user.to_string(),
+                        amount: coins(9_000_000, "uatom")
+                    }
+                    .into()
+                );
+            }
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_roulette() {
+        let mut deps = mock_dependencies();
+        let instantiate_msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
+        let user = "player1";
+
+        // 测试单数字投注
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+        let roulette_game = ExecuteMsg::PlayRoulette {
+            bet_type: RouletteBetType::SingleNumber { number: 17 },
+        };
+        let res = execute(deps.as_mut(), mock_env(), user_info.clone(), roulette_game).unwrap();
+
+        println!("{:?}", res);
+
+        let result_single_number = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        if result_single_number.value == "win" {
+            // 如果玩家获胜，检查是否正确赔付 (35:1 奖金 + 1:1 本金 = 36倍)
             assert_eq!(
                 res.messages[0].msg,
                 BankMsg::Send {
                     to_address: user.to_string(),
-                    amount: coins(
-                        (1_000_000 * multiplier.value.parse::<u64>().unwrap()) as u128,
-                        "uatom"
-                    )
+                    amount: coins(36_000_000, "uatom")
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+
+        // 测试红色投注
+        let user_info = mock_info(user, &coins(2_000_000, "uatom"));
+        let roulette_game = ExecuteMsg::PlayRoulette {
+            bet_type: RouletteBetType::Color { color: Color::Red },
+        };
+        let res = execute(deps.as_mut(), mock_env(), user_info.clone(), roulette_game).unwrap();
+
+        println!("{:?}", res);
+
+        let result_color = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        if result_color.value == "win" {
+            // 如果玩家获胜，检查是否正确赔付 (1:1 奖金 + 1:1 本金 = 2倍)
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(4_000_000, "uatom")
                 }
                 .into()
             );
