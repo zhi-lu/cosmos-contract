@@ -32,16 +32,17 @@ curl https://${IP}:${REST_PORT}/cosmos/tx/v1beta1/txs/${tx_hash}
 
 ## 目前支持的游戏 / Currently Supported Games
 
-| 中文名称   | English Name      | Description                                    |
-|--------|-------------------|------------------------------------------------|
-| 大小游戏   | Double or Nothing | 经典双倍或清零游戏 / Classic Double or Zero Game        |
-| 老虎机游戏  | Slots             | 传统老虎机玩法   /  Traditional slot machine gameplay |
-| 猜数字游戏  | Guess Number      | 数字猜测游戏    / Number Guessing Game               |
-| 21 点游戏 | Mini Blackjack    | 简化版21点玩法   / Simplified Blackjack gameplay     |
-| 硬币抛掷   | Coin Flip         | 正反面猜测游戏   / Heads and tails guessing game      |
-| 骰子对赌   | Dice Roll Duel    | 骰子对战游戏     / Dice Battle Game                  |
-| 幸运转盘   | Lucky Wheel       | 轮盘抽奖游戏     / Roulette Game                     |
-| 百家乐    | Baccarat          | 简单的百家乐游戏    / Simplified Baccarat Game         |
+| 中文名称   | English Name      | Description                                                                             |
+|--------|-------------------|-----------------------------------------------------------------------------------------|
+| 大小游戏   | Double or Nothing | 经典双倍或清零游戏 / Classic Double or Zero Game                                                 |
+| 老虎机游戏  | Slots             | 支持 Basic / Advanced / Mega 三种模式 / Basic, Advanced & Mega slot modes                     |
+| 猜数字游戏  | Guess Number      | 数字猜测游戏    / Number Guessing Game                                                        |
+| 21 点游戏 | Mini Blackjack    | 简化版21点玩法   / Simplified Blackjack gameplay                                              |
+| 硬币抛掷   | Coin Flip         | 正反面猜测游戏   / Heads and tails guessing game                                               |
+| 骰子对赌   | Dice Roll Duel    | 骰子对战游戏     / Dice Battle Game                                                           |
+| 幸运转盘   | Lucky Wheel       | 轮盘抽奖游戏     / Roulette Game                                                              |
+| 百家乐    | Baccarat          | 简单的百家乐游戏    / Simplified Baccarat Game                                                  |
+| 奥马哈扑克  | Omaha Hold'em     | 支持加注的奥马哈扑克，需 2 手牌 + 3 公共牌 / Omaha poker with raise support (2 hole + 3 community cards) |
 
 ## 使用说明 / Usage Notes
 

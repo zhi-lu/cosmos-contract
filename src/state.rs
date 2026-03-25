@@ -2,6 +2,7 @@ use cosmwasm_std::{Addr, Uint128};
 use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use crate::omaha::OmahaState;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct State {
@@ -30,3 +31,7 @@ pub const STATE: Item<State> = Item::new("state");
 
 // 21 点状态
 pub const BLACKJACK_STATE: Map<&Addr, BlackjackState> = Map::new("blackjack_state");
+
+// 奥马哈扑克状态
+pub const OMAHA_STATE: Map<&Addr, OmahaState> = Map::new("omaha_state");
+

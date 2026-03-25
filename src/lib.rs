@@ -3,6 +3,7 @@ mod blackjack;
 mod coin;
 mod dice;
 mod msg;
+mod omaha;
 mod roulette;
 mod slot;
 mod state;
@@ -13,10 +14,15 @@ use crate::blackjack::BlackjackAction;
 use crate::coin::CoinSide;
 use crate::dice::{DiceGameMode, DiceGuessSize};
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::omaha::{
+    best_omaha_hand_rank, hand_rank_name, Card, OmahaAction, OmahaState, OmahaStateResponse,
+    OmahaStage,
+};
 use crate::roulette::{Color, EvenOdd, HighLow, RouletteBetType, RouletteResult};
-use crate::slot::Symbol;
+use crate::slot::{evaluate_advanced, evaluate_basic, evaluate_mega, Symbol, SlotMode};
 use crate::state::{
-    BlackjackState, BlackjackStateResponse, LockedAmountResponse, State, BLACKJACK_STATE, STATE,
+    BlackjackState, BlackjackStateResponse, LockedAmountResponse, State, BLACKJACK_STATE,
+    OMAHA_STATE, STATE,
 };
 use cosmwasm_std::{
     entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Response,
@@ -75,7 +81,7 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
     }
     match msg {
         ExecuteMsg::PlayWar {} => play_war(deps, env, info),
-        ExecuteMsg::PlaySlot {} => play_slot(deps, env, info),
+        ExecuteMsg::PlaySlot { mode } => play_slot(deps, env, info, mode),
         ExecuteMsg::GuessNumber { guess } => play_guess_number(deps, env, info, guess),
         ExecuteMsg::PlayBlackjack { action } => match action {
             BlackjackAction::Start => play_blackjack_start(deps, env, info),
@@ -96,6 +102,7 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         },
         ExecuteMsg::PlayBaccarat { bet_choice } => play_baccarat(deps, env, info, bet_choice),
         ExecuteMsg::PlayRoulette { bet_type } => play_roulette(deps, env, info, bet_type),
+        ExecuteMsg::PlayOmaha { action } => play_omaha(deps, env, info, action),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -123,6 +130,25 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
                 user_cards: state.user_cards,
                 dealer_cards: hide_dealer_cards,
                 bet: state.bet,
+                finished: state.finished,
+            };
+            to_json_binary(&resp)
+        }
+        QueryMsg::GetOmahaState { address } => {
+            let addr = deps.api.addr_validate(&address)?;
+            let state = OMAHA_STATE.load(deps.storage, &addr)?;
+            let dealer_hand = if state.finished {
+                state.dealer_hand.clone()
+            } else {
+                vec![] // 未结束时隐藏庄家手牌
+            };
+            let resp = OmahaStateResponse {
+                player_hand: state.player_hand,
+                dealer_hand,
+                community_cards: state.community_cards,
+                player_total_bet: state.player_total_bet,
+                current_call_amount: state.current_call_amount,
+                stage: state.stage,
                 finished: state.finished,
             };
             to_json_binary(&resp)
@@ -198,10 +224,22 @@ fn play_war(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
 }
 
 /// 老虎机游戏
+/// Slot 游戏
 ///
-/// slot 的游戏, 如果用户中了 3 个相同符号,则用户中了该符号的全部奖励, 如果中了 2 个相同符号,则用户中了该符号的 1/2 的奖励, 否则啥奖励都没有
-fn play_slot(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
-    // 检查用户是否发送了正确金额
+/// Basic 模式  (mode = basic)  : 3 轮 × 1 行
+///   - 3 个相同符号（Wild 可替代）→ 全额倍率
+///   - 2 个相同符号              → 半额倍率
+///   - 全不同                    → 无奖励
+///
+/// Advanced 模式 (mode = advanced) : 5 轮 × 3 行，5 条赢线
+///   - 每条赢线从左起连续 3/4/5 个相同（Wild 可替代）→ 倍率累加
+///   - Scatter 出现 3/4/5+ 个 → 额外奖励倍率 5/15/50
+///   - 总倍率 = 所有赢线倍率 + Scatter 奖励倍率
+///
+/// 下注范围：Basic 100,000 – 10,000,000 uatom
+///          Advanced 200,000 – 10,000,000 uatom（5 线消耗更高）
+fn play_slot(deps: DepsMut, env: Env, info: MessageInfo, mode: SlotMode) -> StdResult<Response> {
+    // ── 验证投注金额 ──────────────────────────────
     let sent_amount = info
         .funds
         .iter()
@@ -209,67 +247,168 @@ fn play_slot(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> 
         .map(|c| c.amount.u128())
         .unwrap_or(0);
 
-    if sent_amount < 100_000 || sent_amount > 10_000_000 {
-        return Err(StdError::generic_err(
-            "Bet must be between 100,000 and 10,000,000 uatom",
-        ));
+    let (min_bet, max_bet) = match mode {
+        SlotMode::Basic    => (100_000u128,  10_000_000u128),
+        SlotMode::Advanced => (200_000u128,  10_000_000u128),
+        SlotMode::Mega     => (500_000u128,  10_000_000u128),
+    };
+
+    if sent_amount < min_bet || sent_amount > max_bet {
+        return Err(StdError::generic_err(format!(
+            "Bet must be between {} and {} uatom for {:?} mode",
+            min_bet, max_bet, mode
+        )));
     }
 
-    // 修改 State 的 locked_amount 值
     let mut state = STATE.load(deps.storage)?;
     state.locked_amount += sent_amount;
 
-    // 创建 3 个随机数
-    let rand1 = utils::generate_random_number(&info, &env, b"slot1");
-    let rand2 = utils::generate_random_number(&info, &env, b"slot2");
-    let rand3 = utils::generate_random_number(&info, &env, b"slot3");
-
-    // 生成 3 个老虎机符号
-    let symbol1 = Symbol::from_u8(rand1);
-    let symbol2 = Symbol::from_u8(rand2);
-    let symbol3 = Symbol::from_u8(rand3);
-
-    let mut payout_multiplier = 0;
-
-    if symbol1 == symbol2 && symbol2 == symbol3 {
-        // 三个相同: 获取全额奖励
-        payout_multiplier = symbol1.payout_multiplier();
-    } else if symbol1 == symbol2 || symbol1 == symbol3 || symbol2 == symbol3 {
-        // 任意两个相同: 获取半额奖励
-        let matched = if symbol1 == symbol2 || symbol1 == symbol3 {
-            &symbol1
-        } else {
-            &symbol2
-        };
-        payout_multiplier = matched.payout_multiplier() / 2;
-    }
-
+    // ── 生成随机数并构建符号 ──────────────────────
     let mut response = Response::new()
-        .add_attribute("slot1", format!("{:?}", symbol1))
-        .add_attribute("slot2", format!("{:?}", symbol2))
-        .add_attribute("slot3", format!("{:?}", symbol3))
+        .add_attribute("mode", format!("{:?}", mode))
         .add_attribute("bet_amount", sent_amount.to_string());
 
+    let payout_multiplier: u64;
+
+    match mode {
+        // ── Basic：3 轮 1 行 ─────────────────────
+        SlotMode::Basic => {
+            let r1 = utils::generate_random_number(&info, &env, b"slot_b1");
+            let r2 = utils::generate_random_number(&info, &env, b"slot_b2");
+            let r3 = utils::generate_random_number(&info, &env, b"slot_b3");
+
+            let s1 = Symbol::from_u8(r1);
+            let s2 = Symbol::from_u8(r2);
+            let s3 = Symbol::from_u8(r3);
+
+            response = response
+                .add_attribute("reel1", format!("{:?}", s1))
+                .add_attribute("reel2", format!("{:?}", s2))
+                .add_attribute("reel3", format!("{:?}", s3));
+
+            let result = evaluate_basic(&s1, &s2, &s3);
+            payout_multiplier = result.multiplier;
+            response = response.add_attribute("win_desc", result.description);
+        }
+
+        // ── Advanced：5 轮 3 行 5 赢线 ───────────
+        SlotMode::Advanced => {
+            // 生成 5 列 × 3 行 = 15 个随机数
+            let salts: &[&[u8]; 15] = &[
+                b"adv00", b"adv01", b"adv02",
+                b"adv10", b"adv11", b"adv12",
+                b"adv20", b"adv21", b"adv22",
+                b"adv30", b"adv31", b"adv32",
+                b"adv40", b"adv41", b"adv42",
+            ];
+
+            let mut rands = [0u32; 15];
+            for (i, salt) in salts.iter().enumerate() {
+                rands[i] = utils::generate_random_number(&info, &env, salt);
+            }
+
+            // 构建 grid[col][row]
+            let grid: [[Symbol; 3]; 5] = [
+                [Symbol::from_u8(rands[0]),  Symbol::from_u8(rands[1]),  Symbol::from_u8(rands[2])],
+                [Symbol::from_u8(rands[3]),  Symbol::from_u8(rands[4]),  Symbol::from_u8(rands[5])],
+                [Symbol::from_u8(rands[6]),  Symbol::from_u8(rands[7]),  Symbol::from_u8(rands[8])],
+                [Symbol::from_u8(rands[9]),  Symbol::from_u8(rands[10]), Symbol::from_u8(rands[11])],
+                [Symbol::from_u8(rands[12]), Symbol::from_u8(rands[13]), Symbol::from_u8(rands[14])],
+            ];
+
+            // 输出每列每行到 attributes
+            for col in 0..5usize {
+                for row in 0..3usize {
+                    response = response.add_attribute(
+                        format!("reel{}_{}", col + 1, row + 1),
+                        format!("{:?}", grid[col][row]),
+                    );
+                }
+            }
+
+            let (total_mult, descriptions) = evaluate_advanced(&grid);
+            payout_multiplier = total_mult;
+            response = response.add_attribute("win_desc", descriptions.join("|"));
+        }
+
+        // ── Mega：6 轮 4 行 10 赢线 + 免费旋转 + Jackpot ──
+        SlotMode::Mega => {
+            // 生成 6 列 × 4 行 = 24 个随机数
+            let salts: &[&[u8]; 24] = &[
+                b"meg00", b"meg01", b"meg02", b"meg03",
+                b"meg10", b"meg11", b"meg12", b"meg13",
+                b"meg20", b"meg21", b"meg22", b"meg23",
+                b"meg30", b"meg31", b"meg32", b"meg33",
+                b"meg40", b"meg41", b"meg42", b"meg43",
+                b"meg50", b"meg51", b"meg52",
+                b"meg53",
+            ];
+
+            let mut rands = [0u32; 24];
+            for (i, salt) in salts.iter().enumerate() {
+                rands[i] = utils::generate_random_number(&info, &env, salt);
+            }
+
+            // 构建 grid[col][row]，6 列 × 4 行
+            let grid: [[Symbol; 4]; 6] = [
+                [Symbol::from_u8(rands[0]),  Symbol::from_u8(rands[1]),  Symbol::from_u8(rands[2]),  Symbol::from_u8(rands[3])],
+                [Symbol::from_u8(rands[4]),  Symbol::from_u8(rands[5]),  Symbol::from_u8(rands[6]),  Symbol::from_u8(rands[7])],
+                [Symbol::from_u8(rands[8]),  Symbol::from_u8(rands[9]),  Symbol::from_u8(rands[10]), Symbol::from_u8(rands[11])],
+                [Symbol::from_u8(rands[12]), Symbol::from_u8(rands[13]), Symbol::from_u8(rands[14]), Symbol::from_u8(rands[15])],
+                [Symbol::from_u8(rands[16]), Symbol::from_u8(rands[17]), Symbol::from_u8(rands[18]), Symbol::from_u8(rands[19])],
+                [Symbol::from_u8(rands[20]), Symbol::from_u8(rands[21]), Symbol::from_u8(rands[22]), Symbol::from_u8(rands[23])],
+            ];
+
+            // 输出每列每行到 attributes
+            for col in 0..6usize {
+                for row in 0..4usize {
+                    response = response.add_attribute(
+                        format!("reel{}_{}", col + 1, row + 1),
+                        format!("{:?}", grid[col][row]),
+                    );
+                }
+            }
+
+            let mega_result = evaluate_mega(&grid);
+            payout_multiplier = mega_result.total_multiplier;
+            let mut desc_parts = mega_result.descriptions;
+            if mega_result.free_spin_triggered {
+                desc_parts.push(format!("free_spin:triggered(x{})", mega_result.free_spin_multiplier));
+            }
+            if mega_result.jackpot {
+                desc_parts.push("jackpot:true".to_string());
+            }
+            response = response
+                .add_attribute("win_desc", desc_parts.join("|"))
+                .add_attribute("free_spin", mega_result.free_spin_triggered.to_string())
+                .add_attribute("jackpot", mega_result.jackpot.to_string());
+        }
+    }
+
+    // ── 结算 ──────────────────────────────────────
     if payout_multiplier > 0 {
-        // 获取奖励
         let payout_amount = sent_amount * payout_multiplier as u128;
-        let payout = Coin {
-            denom: "uatom".to_string(),
-            amount: Uint128::from(payout_amount),
-        };
-        // 发送奖励
-        response = response.add_message(BankMsg::Send {
-            to_address: info.sender.to_string(),
-            amount: vec![payout],
-        });
-        // 更新锁仓金额
+
+        // 防止合约余额不足时超额赔付
+        if payout_amount > state.locked_amount {
+            return Err(StdError::generic_err("Contract has insufficient funds for payout"));
+        }
+
         state.locked_amount -= payout_amount;
-        response = response.add_attribute("payout_multiplier", payout_multiplier.to_string());
+        response = response
+            .add_attribute("result", "win")
+            .add_attribute("payout_multiplier", payout_multiplier.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout_amount),
+                }],
+            });
     } else {
         response = response.add_attribute("result", "lost");
     }
 
-    // 保存状态
     STATE.save(deps.storage, &state)?;
 
     Ok(response)
@@ -1105,6 +1244,360 @@ fn calculate_roulette_payout(bet_type: &RouletteBetType, result: &RouletteResult
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// 奥马哈扑克（Omaha Hold'em）游戏
+//
+// 游戏流程：
+//   1. Start        → 玩家下注底注，发 4 张手牌（庄家也发 4 张），进入 PreFlop
+//   2. Raise/Call   → 在 PreFlop / Flop / Turn 阶段追加/跟注
+//   3. Showdown     → 任意阶段直接摊牌结算
+//   4. Fold         → 放弃本局，损失已押注金额
+//
+// 公共牌揭示节奏：
+//   PreFlop  → Flop（3 张）→ Turn（+1 张）→ River（+1 张）→ Showdown
+//
+// 奥马哈规则：必须用恰好 2 张手牌 + 3 张公共牌组成最佳 5 张
+// 加注规则：
+//   - 加注 (Raise): 附带 funds 金额作为追加注额，当前跟注额 += raise 金额
+//   - 跟注 (Call): 附带 funds 补齐差额（不少于 current_call_amount - player_total_bet）
+//   - Showdown/Fold 时无需再附带 funds
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_omaha(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    action: OmahaAction,
+) -> StdResult<Response> {
+    match action {
+        // ── 开始游戏 ──────────────────────────────────────────────────
+        OmahaAction::Start => {
+            // 检查是否已有进行中游戏
+            if let Ok(existing) = OMAHA_STATE.load(deps.storage, &info.sender) {
+                if !existing.finished {
+                    return Err(StdError::generic_err(
+                        "You already have an active Omaha game. Fold or Showdown first.",
+                    ));
+                }
+            }
+
+            let bet = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if bet < 100_000 || bet > 5_000_000 {
+                return Err(StdError::generic_err(
+                    "Initial bet must be between 100,000 and 5,000,000 uatom",
+                ));
+            }
+
+            // 生成洗牌后的牌组（0..=51 随机排列）
+            let deck = shuffle_deck(&info, &env);
+
+            // 发牌：玩家 4 张 (pos 0-3)，庄家 4 张 (pos 4-7)
+            // 公共牌 5 张 (pos 8-12)，先全部生成但按阶段揭示
+            let player_hand: Vec<Card> = (0..4).map(|i| Card::from_id(deck[i])).collect();
+            let dealer_hand: Vec<Card> = (4..8).map(|i| Card::from_id(deck[i])).collect();
+            // 公共牌全部预生成在 deck[8..13]，按阶段通过 advance_stage 揭示
+            let state = OmahaState {
+                player_hand: player_hand.clone(),
+                dealer_hand,
+                community_cards: vec![],
+                player_total_bet: Uint128::from(bet),
+                current_call_amount: Uint128::from(bet),
+                stage: OmahaStage::PreFlop,
+                finished: false,
+                deck: deck.clone(),
+                deck_pos: 13, // 前 13 张已用
+            };
+
+            OMAHA_STATE.save(deps.storage, &info.sender, &state)?;
+
+            // 同时存储全部公共牌到 deck 的位置已固定，community 按阶段从 deck 取
+            // 更新合约锁仓
+            let mut global_state = STATE.load(deps.storage)?;
+            global_state.locked_amount += bet;
+            STATE.save(deps.storage, &global_state)?;
+
+            Ok(Response::new()
+                .add_attribute("action", "omaha_start")
+                .add_attribute("stage", "PreFlop")
+                .add_attribute("player_hand", format_cards(&player_hand))
+                .add_attribute("community_cards", "[]")
+                .add_attribute("initial_bet", bet.to_string()))
+        }
+
+        // ── 加注 ──────────────────────────────────────────────────────
+        OmahaAction::Raise { amount } => {
+            let mut state = OMAHA_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+            if matches!(state.stage, OmahaStage::Showdown) {
+                return Err(StdError::generic_err("Game is at Showdown, cannot raise"));
+            }
+
+            // 检查附带的 funds
+            let sent = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if sent < amount || amount == 0 {
+                return Err(StdError::generic_err(
+                    "Must attach exactly the raise amount in uatom funds",
+                ));
+            }
+
+            if amount < 50_000 {
+                return Err(StdError::generic_err("Minimum raise is 50,000 uatom"));
+            }
+
+            // 推进阶段并揭示公共牌
+            let (new_stage, community) = advance_stage(&state);
+
+            state.player_total_bet += Uint128::from(amount);
+            state.current_call_amount += Uint128::from(amount);
+            state.stage = new_stage.clone();
+            state.community_cards = community.clone();
+
+            OMAHA_STATE.save(deps.storage, &info.sender, &state)?;
+
+            let mut global_state = STATE.load(deps.storage)?;
+            global_state.locked_amount += sent;
+            STATE.save(deps.storage, &global_state)?;
+
+            Ok(Response::new()
+                .add_attribute("action", "omaha_raise")
+                .add_attribute("raise_amount", amount.to_string())
+                .add_attribute("total_bet", state.player_total_bet.to_string())
+                .add_attribute("stage", format!("{:?}", new_stage))
+                .add_attribute("community_cards", format_cards(&community)))
+        }
+
+        // ── 跟注 ──────────────────────────────────────────────────────
+        OmahaAction::Call => {
+            let mut state = OMAHA_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+            if matches!(state.stage, OmahaStage::Showdown) {
+                return Err(StdError::generic_err("Game is at Showdown, use Showdown action"));
+            }
+
+            // 需要补齐的差额
+            let call_diff = state
+                .current_call_amount
+                .saturating_sub(state.player_total_bet)
+                .u128();
+
+            let sent = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if call_diff > 0 && sent < call_diff {
+                return Err(StdError::generic_err(format!(
+                    "Need to call at least {} uatom to match current bet",
+                    call_diff
+                )));
+            }
+
+            // 推进阶段
+            let (new_stage, community) = advance_stage(&state);
+
+            state.player_total_bet += Uint128::from(call_diff.max(sent));
+            state.stage = new_stage.clone();
+            state.community_cards = community.clone();
+
+            OMAHA_STATE.save(deps.storage, &info.sender, &state)?;
+
+            if sent > 0 {
+                let mut global_state = STATE.load(deps.storage)?;
+                global_state.locked_amount += sent;
+                STATE.save(deps.storage, &global_state)?;
+            }
+
+            Ok(Response::new()
+                .add_attribute("action", "omaha_call")
+                .add_attribute("call_amount", call_diff.to_string())
+                .add_attribute("total_bet", state.player_total_bet.to_string())
+                .add_attribute("stage", format!("{:?}", new_stage))
+                .add_attribute("community_cards", format_cards(&community)))
+        }
+
+        // ── 弃牌 ──────────────────────────────────────────────────────
+        OmahaAction::Fold => {
+            let mut state = OMAHA_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+
+            state.finished = true;
+            OMAHA_STATE.save(deps.storage, &info.sender, &state)?;
+
+            // 玩家已下注金额归合约
+            Ok(Response::new()
+                .add_attribute("action", "omaha_fold")
+                .add_attribute("result", "folded")
+                .add_attribute("lost_amount", state.player_total_bet.to_string()))
+        }
+
+        // ── 摊牌结算 ───────────────────────────────────────────────────
+        OmahaAction::Showdown => {
+            let mut state = OMAHA_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+
+            // 揭示全部 5 张公共牌
+            let full_community: Vec<Card> = (8..13).map(|i| Card::from_id(state.deck[i])).collect();
+
+            // 评估双方最佳手牌
+            let player_rank = best_omaha_hand_rank(&state.player_hand, &full_community);
+            let dealer_rank = best_omaha_hand_rank(&state.dealer_hand, &full_community);
+
+            let player_hand_name = hand_rank_name(player_rank);
+            let dealer_hand_name = hand_rank_name(dealer_rank);
+
+            let total_bet = state.player_total_bet.u128();
+
+            let mut global_state = STATE.load(deps.storage)?;
+            let mut response = Response::new()
+                .add_attribute("action", "omaha_showdown")
+                .add_attribute("player_hand", format_cards(&state.player_hand))
+                .add_attribute("dealer_hand", format_cards(&state.dealer_hand))
+                .add_attribute("community_cards", format_cards(&full_community))
+                .add_attribute("player_rank_name", player_hand_name)
+                .add_attribute("dealer_rank_name", dealer_hand_name)
+                .add_attribute("player_rank", player_rank.to_string())
+                .add_attribute("dealer_rank", dealer_rank.to_string());
+
+            if player_rank > dealer_rank {
+                // 玩家赢：获得 2× 下注额
+                let payout = total_bet * 2;
+                global_state.locked_amount =
+                    global_state.locked_amount.saturating_sub(payout);
+                response = response
+                    .add_attribute("result", "player_win")
+                    .add_attribute("payout", payout.to_string())
+                    .add_message(BankMsg::Send {
+                        to_address: info.sender.to_string(),
+                        amount: vec![Coin {
+                            denom: "uatom".to_string(),
+                            amount: Uint128::from(payout),
+                        }],
+                    });
+            } else if dealer_rank > player_rank {
+                // 庄家赢：玩家损失下注额（已留在合约中）
+                response = response
+                    .add_attribute("result", "dealer_win")
+                    .add_attribute("payout", "0");
+            } else {
+                // 平局：退还下注额
+                global_state.locked_amount =
+                    global_state.locked_amount.saturating_sub(total_bet);
+                response = response
+                    .add_attribute("result", "tie")
+                    .add_attribute("payout", total_bet.to_string())
+                    .add_message(BankMsg::Send {
+                        to_address: info.sender.to_string(),
+                        amount: vec![Coin {
+                            denom: "uatom".to_string(),
+                            amount: Uint128::from(total_bet),
+                        }],
+                    });
+            }
+
+            state.finished = true;
+            state.community_cards = full_community;
+            OMAHA_STATE.save(deps.storage, &info.sender, &state)?;
+            STATE.save(deps.storage, &global_state)?;
+
+            Ok(response)
+        }
+    }
+}
+
+/// 根据当前阶段推进到下一阶段，并返回应揭示的公共牌列表
+fn advance_stage(state: &OmahaState) -> (OmahaStage, Vec<Card>) {
+    let deck = &state.deck;
+    match state.stage {
+        OmahaStage::PreFlop => {
+            // 翻牌：揭示 3 张公共牌（deck[8..11]）
+            let community = (8..11).map(|i| Card::from_id(deck[i])).collect();
+            (OmahaStage::Flop, community)
+        }
+        OmahaStage::Flop => {
+            // 转牌：揭示 4 张（deck[8..12]）
+            let community = (8..12).map(|i| Card::from_id(deck[i])).collect();
+            (OmahaStage::Turn, community)
+        }
+        OmahaStage::Turn => {
+            // 河牌：揭示全部 5 张（deck[8..13]）
+            let community = (8..13).map(|i| Card::from_id(deck[i])).collect();
+            (OmahaStage::River, community)
+        }
+        OmahaStage::River | OmahaStage::Showdown => {
+            // 已经揭示完毕，保持不变
+            let community = state.community_cards.clone();
+            (OmahaStage::Showdown, community)
+        }
+    }
+}
+
+/// 生成洗牌后的 52 张牌（card_id 0..=51）
+fn shuffle_deck(info: &MessageInfo, env: &Env) -> Vec<u8> {
+    // 用多个盐生成足够熵来 Fisher-Yates 洗牌
+    let mut deck: Vec<u8> = (0u8..52).collect();
+    // 为每张牌生成一个随机权重
+    let mut weights: Vec<u32> = (0u8..52)
+        .map(|i| {
+            let salt = format!("omaha_deck_{}", i);
+            utils::generate_random_number(info, env, salt.as_bytes())
+        })
+        .collect();
+
+    // 按权重排序模拟洗牌（简单方案：稳定的伪随机排列）
+    // Fisher-Yates 风格：用权重 XOR index 保证唯一性
+    for i in (1..52usize).rev() {
+        let j = (weights[i] as usize + i * 97) % (i + 1);
+        deck.swap(i, j);
+        weights.swap(i, j);
+    }
+    deck
+}
+
+/// 格式化 Card 列表为可读字符串
+fn format_cards(cards: &[Card]) -> String {
+    let parts: Vec<String> = cards
+        .iter()
+        .map(|c| {
+            let rank_str = match c.rank {
+                11 => "J".to_string(),
+                12 => "Q".to_string(),
+                13 => "K".to_string(),
+                14 => "A".to_string(),
+                n => n.to_string(),
+            };
+            let suit_str = match c.suit {
+                omaha::Suit::Spades   => "♠",
+                omaha::Suit::Hearts   => "♥",
+                omaha::Suit::Diamonds => "♦",
+                omaha::Suit::Clubs    => "♣",
+            };
+            format!("{}{}", rank_str, suit_str)
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_play_slot() {
+    pub fn test_play_slot_basic() {
         let mut deps = mock_dependencies();
 
         // 初始化合约
@@ -1190,30 +1683,136 @@ mod tests {
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
-        // 模拟一次用户下注并执行 slot 游戏
+        // Basic 模式下注
         let user_info = mock_info("user", &coins(100_000, "uatom"));
         let env = mock_env();
-        let res = play_slot(deps.as_mut(), env.clone(), user_info.clone()).unwrap();
+        let res = play_slot(deps.as_mut(), env.clone(), user_info.clone(), SlotMode::Basic).unwrap();
 
-        // 检查返回的事件属性
-        let attrs = res.attributes;
+        let attrs = &res.attributes;
 
-        // 如果用户赢了或平局,应该包含 payout_multiplier,否则包含 result = lost
-        let payout_attr = attrs.iter().find(|a| a.key == "payout_multiplier");
-        let result_attr = attrs.iter().find(|a| a.key == "result");
+        // 检查 mode 属性
+        let mode_attr = attrs.iter().find(|a| a.key == "mode").expect("mode missing");
+        assert_eq!(mode_attr.value, "Basic");
 
-        // 确保包含下注金额
-        let bet_attr = attrs
-            .iter()
-            .find(|a| a.key == "bet_amount")
-            .expect("bet_amount missing");
+        // 检查下注金额
+        let bet_attr = attrs.iter().find(|a| a.key == "bet_amount").expect("bet_amount missing");
         assert_eq!(bet_attr.value, "100000");
 
-        // 至少应该有一个
-        assert!(
-            payout_attr.is_some() || result_attr.is_some(),
-            "expected either payout_multiplier or result"
+        // 检查三个轮盘符号存在
+        assert!(attrs.iter().any(|a| a.key == "reel1"), "reel1 missing");
+        assert!(attrs.iter().any(|a| a.key == "reel2"), "reel2 missing");
+        assert!(attrs.iter().any(|a| a.key == "reel3"), "reel3 missing");
+
+        // 检查 win_desc
+        assert!(attrs.iter().any(|a| a.key == "win_desc"), "win_desc missing");
+
+        // 应该有 result 或 payout_multiplier
+        let has_result = attrs.iter().any(|a| a.key == "result");
+        let has_payout = attrs.iter().any(|a| a.key == "payout_multiplier");
+        assert!(has_result || has_payout, "expected result or payout_multiplier");
+
+        // 投注金额下限检查
+        let too_small = play_slot(
+            deps.as_mut(), env.clone(),
+            mock_info("user", &coins(50_000, "uatom")),
+            SlotMode::Basic,
         );
+        assert!(too_small.is_err(), "should reject bet below minimum");
+    }
+
+    #[test]
+    pub fn test_play_slot_advanced() {
+        let mut deps = mock_dependencies();
+
+        let msg = InstantiateMsg {};
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        // Advanced 模式下注
+        let user_info = mock_info("user", &coins(500_000, "uatom"));
+        let env = mock_env();
+        let res = play_slot(deps.as_mut(), env.clone(), user_info.clone(), SlotMode::Advanced).unwrap();
+
+        let attrs = &res.attributes;
+
+        // 检查 mode 属性
+        let mode_attr = attrs.iter().find(|a| a.key == "mode").expect("mode missing");
+        assert_eq!(mode_attr.value, "Advanced");
+
+        // 检查 5 列 × 3 行 = 15 个格子都有输出
+        for col in 1..=5usize {
+            for row in 1..=3usize {
+                let key = format!("reel{}_{}", col, row);
+                assert!(
+                    attrs.iter().any(|a| a.key == key),
+                    "missing grid cell {}",
+                    key
+                );
+            }
+        }
+
+        // 检查 win_desc
+        assert!(attrs.iter().any(|a| a.key == "win_desc"), "win_desc missing");
+
+        // 应有 result 或 payout_multiplier
+        let has_result = attrs.iter().any(|a| a.key == "result");
+        let has_payout = attrs.iter().any(|a| a.key == "payout_multiplier");
+        assert!(has_result || has_payout, "expected result or payout_multiplier");
+
+        // Advanced 模式最低下注 200_000，低于时应报错
+        let too_small = play_slot(
+            deps.as_mut(), env.clone(),
+            mock_info("user", &coins(100_000, "uatom")),
+            SlotMode::Advanced,
+        );
+        assert!(too_small.is_err(), "should reject bet below Advanced minimum");
+    }
+
+    #[test]
+    pub fn test_play_slot_win_payout() {
+        // 测试赢时支付金额正确（通过 execute 入口）
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let user = "player1";
+        let bet = 1_000_000u128;
+        let user_info = mock_info(user, &coins(bet, "uatom"));
+        let env = mock_env();
+
+        let res = execute(
+            deps.as_mut(), env, user_info,
+            ExecuteMsg::PlaySlot { mode: SlotMode::Basic },
+        ).unwrap();
+
+        let has_result = res.attributes.iter().any(|a| a.key == "result");
+        let has_payout = res.attributes.iter().any(|a| a.key == "payout_multiplier");
+        assert!(has_result || has_payout);
+
+        if has_payout {
+            // 如果赢了，支付消息必须存在
+            assert_eq!(res.messages.len(), 1);
+            let payout_mult: u128 = res
+                .attributes
+                .iter()
+                .find(|a| a.key == "payout_multiplier")
+                .unwrap()
+                .value
+                .parse()
+                .unwrap();
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet * payout_mult, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            // 如果输了，没有支付消息
+            assert_eq!(res.messages.len(), 0);
+        }
     }
 
     #[test]
@@ -1732,5 +2331,290 @@ mod tests {
         } else {
             assert_eq!(res.messages.len(), 0);
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Mega Slot 测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_play_slot_mega() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        // Mega 模式最低投注 500_000
+        let user_info = mock_info("user", &coins(500_000, "uatom"));
+        let res = play_slot(deps.as_mut(), mock_env(), user_info, SlotMode::Mega).unwrap();
+        let attrs = &res.attributes;
+
+        // mode 属性
+        let mode_attr = attrs.iter().find(|a| a.key == "mode").expect("mode missing");
+        assert_eq!(mode_attr.value, "Mega");
+
+        // 6 列 × 4 行 = 24 格
+        for col in 1..=6usize {
+            for row in 1..=4usize {
+                let key = format!("reel{}_{}", col, row);
+                assert!(attrs.iter().any(|a| a.key == key), "missing {}", key);
+            }
+        }
+
+        // 必须包含 free_spin 和 jackpot 属性
+        assert!(attrs.iter().any(|a| a.key == "free_spin"), "free_spin missing");
+        assert!(attrs.iter().any(|a| a.key == "jackpot"), "jackpot missing");
+        assert!(attrs.iter().any(|a| a.key == "win_desc"), "win_desc missing");
+
+        // 低于最低投注应报错
+        let too_small = play_slot(
+            deps.as_mut(), mock_env(),
+            mock_info("user", &coins(100_000, "uatom")),
+            SlotMode::Mega,
+        );
+        assert!(too_small.is_err(), "should reject bet below Mega minimum");
+    }
+
+    #[test]
+    fn test_play_slot_mega_payout() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let user = "player1";
+        let bet = 1_000_000u128;
+        let res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(user, &coins(bet, "uatom")),
+            ExecuteMsg::PlaySlot { mode: SlotMode::Mega },
+        ).unwrap();
+
+        let has_result = res.attributes.iter().any(|a| a.key == "result");
+        let has_payout = res.attributes.iter().any(|a| a.key == "payout_multiplier");
+        assert!(has_result || has_payout, "expected result or payout_multiplier");
+
+        if has_payout {
+            assert_eq!(res.messages.len(), 1);
+            let payout_mult: u128 = res
+                .attributes
+                .iter()
+                .find(|a| a.key == "payout_multiplier")
+                .unwrap()
+                .value
+                .parse()
+                .unwrap();
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet * payout_mult, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 奥马哈扑克测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_omaha_full_flow() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "omaha_player";
+        let bet = 500_000u128;
+
+        // ── Step 1: Start ──────────────────────────────────────
+        let start_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(bet, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Start },
+        ).unwrap();
+
+        let stage = start_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(stage.value, "PreFlop");
+
+        let player_hand_attr = start_res.attributes.iter().find(|a| a.key == "player_hand").unwrap();
+        assert!(!player_hand_attr.value.is_empty(), "player_hand should not be empty");
+
+        // ── Step 2: Query state ────────────────────────────────
+        let bin = query(
+            deps.as_ref(), mock_env(),
+            QueryMsg::GetOmahaState { address: player.to_string() },
+        ).unwrap();
+        let state_resp: OmahaStateResponse = from_json(&bin).unwrap();
+        assert_eq!(state_resp.player_hand.len(), 4, "player should have 4 cards");
+        assert_eq!(state_resp.dealer_hand.len(), 0, "dealer hand hidden before showdown");
+        assert_eq!(state_resp.community_cards.len(), 0, "no community cards at PreFlop");
+        assert!(!state_resp.finished);
+
+        // ── Step 3: Raise (PreFlop → Flop) ───────────────────
+        let raise_amount = 200_000u128;
+        let raise_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(raise_amount, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Raise { amount: raise_amount } },
+        ).unwrap();
+
+        let raise_stage = raise_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(raise_stage.value, "Flop");
+
+        let community_attr = raise_res.attributes.iter().find(|a| a.key == "community_cards").unwrap();
+        assert!(community_attr.value.contains(","), "flop should have 3 cards");
+
+        // ── Step 4: Call (Flop → Turn) ────────────────────────
+        let call_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Call },
+        ).unwrap();
+        let call_stage = call_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(call_stage.value, "Turn");
+
+        // ── Step 5: Showdown ──────────────────────────────────
+        let showdown_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Showdown },
+        ).unwrap();
+
+        let result = showdown_res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        assert!(
+            result.value == "player_win" || result.value == "dealer_win" || result.value == "tie",
+            "unexpected result: {}",
+            result.value
+        );
+
+        // showdown 后庄家手牌应可见
+        let bin2 = query(
+            deps.as_ref(), mock_env(),
+            QueryMsg::GetOmahaState { address: player.to_string() },
+        ).unwrap();
+        let final_state: OmahaStateResponse = from_json(&bin2).unwrap();
+        assert!(final_state.finished);
+        assert_eq!(final_state.dealer_hand.len(), 4, "dealer hand visible after showdown");
+        assert_eq!(final_state.community_cards.len(), 5, "all 5 community cards after showdown");
+    }
+
+    #[test]
+    fn test_omaha_fold() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "omaha_fold_player";
+        let bet = 300_000u128;
+
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(bet, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Start },
+        ).unwrap();
+
+        // 弃牌
+        let fold_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Fold },
+        ).unwrap();
+
+        let result = fold_res.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert_eq!(result.value, "folded");
+
+        // 弃牌后游戏结束，不能再操作
+        let err = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Showdown },
+        );
+        assert!(err.is_err(), "should not be able to showdown after fold");
+    }
+
+    #[test]
+    fn test_omaha_no_duplicate_game() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "omaha_dup_player";
+
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(100_000, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Start },
+        ).unwrap();
+
+        // 重复开始应报错
+        let err = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(100_000, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Start },
+        );
+        assert!(err.is_err(), "should not allow duplicate active game");
+    }
+
+    #[test]
+    fn test_omaha_raise_then_showdown() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "omaha_raise_player";
+
+        // Start
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(500_000, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Start },
+        ).unwrap();
+
+        // Raise 1: PreFlop → Flop
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(100_000, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Raise { amount: 100_000 } },
+        ).unwrap();
+
+        // Raise 2: Flop → Turn
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(200_000, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Raise { amount: 200_000 } },
+        ).unwrap();
+
+        // Raise 3: Turn → River
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(300_000, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Raise { amount: 300_000 } },
+        ).unwrap();
+
+        // Showdown
+        let sd = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayOmaha { action: OmahaAction::Showdown },
+        ).unwrap();
+
+        let result = sd.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert!(
+            ["player_win", "dealer_win", "tie"].contains(&result.value.as_str()),
+            "unexpected result: {}",
+            result.value
+        );
+
+        // 验证 player_rank_name 和 dealer_rank_name 存在
+        assert!(sd.attributes.iter().any(|a| a.key == "player_rank_name"));
+        assert!(sd.attributes.iter().any(|a| a.key == "dealer_rank_name"));
     }
 }
