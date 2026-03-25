@@ -43,6 +43,12 @@ curl https://${IP}:${REST_PORT}/cosmos/tx/v1beta1/txs/${tx_hash}
 | 幸运转盘   | Lucky Wheel       | 轮盘抽奖游戏     / Roulette Game                                                              |
 | 百家乐    | Baccarat          | 简单的百家乐游戏    / Simplified Baccarat Game                                                  |
 | 奥马哈扑克  | Omaha Hold'em     | 支持加注的奥马哈扑克，需 2 手牌 + 3 公共牌 / Omaha poker with raise support (2 hole + 3 community cards) |
+| 德州扑克   | Texas Hold'em     | 支持加注、过牌、全押的德州扑克 / Texas poker with raise, check & all-in support                        |
+| 三公     | San Gong          | 三张牌比点数，三公 > 混合九 > 普通点数 / Three-card game comparing points, special hands win more       |
+| 骰宝     | Sic Bo            | 三颗骰子多种投注：大小/单双/总和/三同号/单骰/组合 / Three dice game with multiple bet types                   |
+| 基诺     | Keno              | 从 1-80 选 1-10 个号码，系统开 20 个号 / Pick 1-10 numbers from 1-80, system draws 20              |
+| 刮刮乐    | Scratch Card      | 3×3 格子刮卡，8 条中奖线可叠加 / 3×3 grid scratch card with 8 win lines, stackable payouts          |
+| 斗牛     | Bull Fight        | 五张牌比牛，含五小牛/四炸/五花牛/牛牛等特殊牌型 / Five-card bull game with special hands                      |
 
 ## 使用说明 / Usage Notes
 

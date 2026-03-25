@@ -1,28 +1,49 @@
 mod baccarat;
 mod blackjack;
+mod bullfight;
 mod coin;
 mod dice;
+mod keno;
 mod msg;
 mod omaha;
 mod roulette;
+mod sangong;
+mod scratch;
+mod sicbo;
 mod slot;
 mod state;
+mod texas;
 mod utils;
 
 use crate::baccarat::BaccaratBet;
 use crate::blackjack::BlackjackAction;
+use crate::bullfight::{
+    bull_hand_type_name, bull_payout_multiplier, evaluate_bull_hand, BullCard,
+};
 use crate::coin::CoinSide;
 use crate::dice::{DiceGameMode, DiceGuessSize};
+use crate::keno::{calculate_hits, keno_payout_multiplier, validate_picks};
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::omaha::{
     best_omaha_hand_rank, hand_rank_name, Card, OmahaAction, OmahaState, OmahaStateResponse,
     OmahaStage,
 };
 use crate::roulette::{Color, EvenOdd, HighLow, RouletteBetType, RouletteResult};
+use crate::sangong::{
+    evaluate_sangong_hand, hand_type_name, payout_multiplier as sangong_payout_multiplier,
+    SanGongCard, SanGongHandType,
+};
+use crate::scratch::{
+    bet_range as scratch_bet_range, evaluate_scratch_card, ScratchCardType, ScratchSymbol,
+};
+use crate::sicbo::{calculate_sicbo_payout, validate_bet, SicBoBetType, SicBoResult};
 use crate::slot::{evaluate_advanced, evaluate_basic, evaluate_mega, Symbol, SlotMode};
 use crate::state::{
     BlackjackState, BlackjackStateResponse, LockedAmountResponse, State, BLACKJACK_STATE,
-    OMAHA_STATE, STATE,
+    OMAHA_STATE, STATE, TEXAS_STATE,
+};
+use crate::texas::{
+    best_texas_hand_rank, TexasAction, TexasState, TexasStateResponse, TexasStage,
 };
 use cosmwasm_std::{
     entry_point, to_json_binary, BankMsg, Binary, Coin, Deps, DepsMut, Env, MessageInfo, Response,
@@ -103,6 +124,12 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         ExecuteMsg::PlayBaccarat { bet_choice } => play_baccarat(deps, env, info, bet_choice),
         ExecuteMsg::PlayRoulette { bet_type } => play_roulette(deps, env, info, bet_type),
         ExecuteMsg::PlayOmaha { action } => play_omaha(deps, env, info, action),
+        ExecuteMsg::PlayTexas { action } => play_texas(deps, env, info, action),
+        ExecuteMsg::PlaySanGong {} => play_sangong(deps, env, info),
+        ExecuteMsg::PlaySicBo { bet_type } => play_sicbo(deps, env, info, bet_type),
+        ExecuteMsg::PlayKeno { picks } => play_keno(deps, env, info, picks),
+        ExecuteMsg::PlayScratchCard { card_type } => play_scratch_card(deps, env, info, card_type),
+        ExecuteMsg::PlayBullFight {} => play_bullfight(deps, env, info),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
     }
 }
@@ -150,6 +177,26 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
                 current_call_amount: state.current_call_amount,
                 stage: state.stage,
                 finished: state.finished,
+            };
+            to_json_binary(&resp)
+        }
+        QueryMsg::GetTexasState { address } => {
+            let addr = deps.api.addr_validate(&address)?;
+            let state = TEXAS_STATE.load(deps.storage, &addr)?;
+            let dealer_hand = if state.finished {
+                state.dealer_hand.clone()
+            } else {
+                vec![] // 未结束时隐藏庄家手牌
+            };
+            let resp = TexasStateResponse {
+                player_hand: state.player_hand,
+                dealer_hand,
+                community_cards: state.community_cards,
+                player_total_bet: state.player_total_bet,
+                current_call_amount: state.current_call_amount,
+                stage: state.stage,
+                finished: state.finished,
+                all_in: state.all_in,
             };
             to_json_binary(&resp)
         }
@@ -1598,6 +1645,1051 @@ fn format_cards(cards: &[Card]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// 德州扑克（Texas Hold'em）
+//
+// 流程：
+//   1. Start        → 玩家下注底注，发 2 张手牌（庄家也发 2 张），进入 PreFlop
+//   2. Raise/Call/Check → 在 PreFlop / Flop / Turn / River 阶段操作
+//   3. AllIn        → 全押，直接进入 Showdown 自动揭示所有公共牌
+//   4. Showdown     → 任意阶段直接摊牌结算
+//   5. Fold         → 放弃本局，损失已押注金额
+//
+// 公共牌揭示节奏：
+//   PreFlop  → Flop（3 张）→ Turn（+1 张）→ River（+1 张）→ Showdown
+//
+// 德州规则：从 2 张手牌 + 5 张公共牌中选最佳 5 张组合
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_texas(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    action: TexasAction,
+) -> StdResult<Response> {
+    match action {
+        // ── 开始游戏 ──────────────────────────────────────────────────
+        TexasAction::Start => {
+            // 检查是否已有进行中游戏
+            if let Ok(existing) = TEXAS_STATE.load(deps.storage, &info.sender) {
+                if !existing.finished {
+                    return Err(StdError::generic_err(
+                        "You already have an active Texas Hold'em game. Fold or Showdown first.",
+                    ));
+                }
+            }
+
+            let bet = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if bet < 100_000 || bet > 5_000_000 {
+                return Err(StdError::generic_err(
+                    "Initial bet must be between 100,000 and 5,000,000 uatom",
+                ));
+            }
+
+            // 洗牌
+            let deck = shuffle_texas_deck(&info, &env);
+
+            // 发牌：玩家 2 张 (pos 0-1)，庄家 2 张 (pos 2-3)
+            // 公共牌 5 张 (pos 4-8)，按阶段揭示
+            let player_hand: Vec<texas::Card> =
+                (0..2).map(|i| texas::Card::from_id(deck[i])).collect();
+            let dealer_hand: Vec<texas::Card> =
+                (2..4).map(|i| texas::Card::from_id(deck[i])).collect();
+
+            let state = TexasState {
+                player_hand: player_hand.clone(),
+                dealer_hand,
+                community_cards: vec![],
+                player_total_bet: Uint128::from(bet),
+                current_call_amount: Uint128::from(bet),
+                stage: TexasStage::PreFlop,
+                finished: false,
+                all_in: false,
+                deck: deck.clone(),
+            };
+
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            let mut global_state = STATE.load(deps.storage)?;
+            global_state.locked_amount += bet;
+            STATE.save(deps.storage, &global_state)?;
+
+            Ok(Response::new()
+                .add_attribute("action", "texas_start")
+                .add_attribute("stage", "PreFlop")
+                .add_attribute("player_hand", format_texas_cards(&player_hand))
+                .add_attribute("community_cards", "[]")
+                .add_attribute("initial_bet", bet.to_string()))
+        }
+
+        // ── 加注 ──────────────────────────────────────────────────────
+        TexasAction::Raise { amount } => {
+            let mut state = TEXAS_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+            if state.all_in {
+                return Err(StdError::generic_err("Already all-in, cannot raise"));
+            }
+            if matches!(state.stage, TexasStage::Showdown) {
+                return Err(StdError::generic_err("Game is at Showdown, cannot raise"));
+            }
+
+            let sent = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if sent < amount || amount == 0 {
+                return Err(StdError::generic_err(
+                    "Must attach exactly the raise amount in uatom funds",
+                ));
+            }
+
+            if amount < 50_000 {
+                return Err(StdError::generic_err("Minimum raise is 50,000 uatom"));
+            }
+
+            let (new_stage, community) = advance_texas_stage(&state);
+
+            state.player_total_bet += Uint128::from(amount);
+            state.current_call_amount += Uint128::from(amount);
+            state.stage = new_stage.clone();
+            state.community_cards = community.clone();
+
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            let mut global_state = STATE.load(deps.storage)?;
+            global_state.locked_amount += sent;
+            STATE.save(deps.storage, &global_state)?;
+
+            Ok(Response::new()
+                .add_attribute("action", "texas_raise")
+                .add_attribute("raise_amount", amount.to_string())
+                .add_attribute("total_bet", state.player_total_bet.to_string())
+                .add_attribute("stage", format!("{:?}", new_stage))
+                .add_attribute("community_cards", format_texas_cards(&community)))
+        }
+
+        // ── 跟注 ──────────────────────────────────────────────────────
+        TexasAction::Call => {
+            let mut state = TEXAS_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+            if state.all_in {
+                return Err(StdError::generic_err("Already all-in, cannot call"));
+            }
+            if matches!(state.stage, TexasStage::Showdown) {
+                return Err(StdError::generic_err(
+                    "Game is at Showdown, use Showdown action",
+                ));
+            }
+
+            let call_diff = state
+                .current_call_amount
+                .saturating_sub(state.player_total_bet)
+                .u128();
+
+            let sent = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if call_diff > 0 && sent < call_diff {
+                return Err(StdError::generic_err(format!(
+                    "Need to call at least {} uatom to match current bet",
+                    call_diff
+                )));
+            }
+
+            let (new_stage, community) = advance_texas_stage(&state);
+
+            state.player_total_bet += Uint128::from(call_diff.max(sent));
+            state.stage = new_stage.clone();
+            state.community_cards = community.clone();
+
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            if sent > 0 {
+                let mut global_state = STATE.load(deps.storage)?;
+                global_state.locked_amount += sent;
+                STATE.save(deps.storage, &global_state)?;
+            }
+
+            Ok(Response::new()
+                .add_attribute("action", "texas_call")
+                .add_attribute("call_amount", call_diff.to_string())
+                .add_attribute("total_bet", state.player_total_bet.to_string())
+                .add_attribute("stage", format!("{:?}", new_stage))
+                .add_attribute("community_cards", format_texas_cards(&community)))
+        }
+
+        // ── 过牌 ──────────────────────────────────────────────────────
+        TexasAction::Check => {
+            let mut state = TEXAS_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+            if state.all_in {
+                return Err(StdError::generic_err("Already all-in, cannot check"));
+            }
+            if matches!(state.stage, TexasStage::Showdown) {
+                return Err(StdError::generic_err(
+                    "Game is at Showdown, use Showdown action",
+                ));
+            }
+
+            // Check 仅在差额为 0 时允许（即无需补齐）
+            let diff = state
+                .current_call_amount
+                .saturating_sub(state.player_total_bet)
+                .u128();
+            if diff > 0 {
+                return Err(StdError::generic_err(
+                    "Cannot check when you owe a call amount. Use Call or Raise instead.",
+                ));
+            }
+
+            let (new_stage, community) = advance_texas_stage(&state);
+
+            state.stage = new_stage.clone();
+            state.community_cards = community.clone();
+
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            Ok(Response::new()
+                .add_attribute("action", "texas_check")
+                .add_attribute("total_bet", state.player_total_bet.to_string())
+                .add_attribute("stage", format!("{:?}", new_stage))
+                .add_attribute("community_cards", format_texas_cards(&community)))
+        }
+
+        // ── 全押 ──────────────────────────────────────────────────────
+        TexasAction::AllIn { amount } => {
+            let mut state = TEXAS_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+            if state.all_in {
+                return Err(StdError::generic_err("Already all-in"));
+            }
+            if matches!(state.stage, TexasStage::Showdown) {
+                return Err(StdError::generic_err("Game is at Showdown, cannot all-in"));
+            }
+
+            let sent = info
+                .funds
+                .iter()
+                .find(|c| c.denom == "uatom")
+                .map(|c| c.amount.u128())
+                .unwrap_or(0);
+
+            if sent < amount || amount == 0 {
+                return Err(StdError::generic_err(
+                    "Must attach exactly the all-in amount in uatom funds",
+                ));
+            }
+
+            if amount < 100_000 {
+                return Err(StdError::generic_err(
+                    "All-in amount must be at least 100,000 uatom",
+                ));
+            }
+
+            // 全押：揭示全部公共牌，进入 Showdown
+            let full_community: Vec<texas::Card> =
+                (4..9).map(|i| texas::Card::from_id(state.deck[i])).collect();
+
+            state.player_total_bet += Uint128::from(amount);
+            state.current_call_amount += Uint128::from(amount);
+            state.all_in = true;
+            state.community_cards = full_community.clone();
+            state.stage = TexasStage::Showdown;
+
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            let mut global_state = STATE.load(deps.storage)?;
+            global_state.locked_amount += sent;
+            STATE.save(deps.storage, &global_state)?;
+
+            // 自动进入 Showdown 结算
+            settle_texas(deps, info, state)
+        }
+
+        // ── 弃牌 ──────────────────────────────────────────────────────
+        TexasAction::Fold => {
+            let mut state = TEXAS_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+
+            state.finished = true;
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            Ok(Response::new()
+                .add_attribute("action", "texas_fold")
+                .add_attribute("result", "folded")
+                .add_attribute("lost_amount", state.player_total_bet.to_string()))
+        }
+
+        // ── 摊牌结算 ─────────────────────────────────────────────────
+        TexasAction::Showdown => {
+            let mut state = TEXAS_STATE.load(deps.storage, &info.sender)?;
+            if state.finished {
+                return Err(StdError::generic_err("Game already finished"));
+            }
+
+            // 揭示全部 5 张公共牌
+            let full_community: Vec<texas::Card> =
+                (4..9).map(|i| texas::Card::from_id(state.deck[i])).collect();
+            state.community_cards = full_community;
+            state.stage = TexasStage::Showdown;
+
+            TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+
+            settle_texas(deps, info, state)
+        }
+    }
+}
+
+/// 德州扑克结算逻辑
+fn settle_texas(
+    deps: DepsMut,
+    info: MessageInfo,
+    mut state: TexasState,
+) -> StdResult<Response> {
+    let full_community = &state.community_cards;
+
+    // 评估双方最佳手牌
+    let player_rank = best_texas_hand_rank(&state.player_hand, full_community);
+    let dealer_rank = best_texas_hand_rank(&state.dealer_hand, full_community);
+
+    let player_hand_name = texas::hand_rank_name(player_rank);
+    let dealer_hand_name = texas::hand_rank_name(dealer_rank);
+
+    let total_bet = state.player_total_bet.u128();
+
+    let mut global_state = STATE.load(deps.storage)?;
+    let mut response = Response::new()
+        .add_attribute("action", "texas_showdown")
+        .add_attribute("player_hand", format_texas_cards(&state.player_hand))
+        .add_attribute("dealer_hand", format_texas_cards(&state.dealer_hand))
+        .add_attribute(
+            "community_cards",
+            format_texas_cards(full_community),
+        )
+        .add_attribute("player_rank_name", player_hand_name)
+        .add_attribute("dealer_rank_name", dealer_hand_name)
+        .add_attribute("player_rank", player_rank.to_string())
+        .add_attribute("dealer_rank", dealer_rank.to_string());
+
+    if player_rank > dealer_rank {
+        // 玩家赢：获得 2× 下注额
+        let payout = total_bet * 2;
+        global_state.locked_amount = global_state.locked_amount.saturating_sub(payout);
+        response = response
+            .add_attribute("result", "player_win")
+            .add_attribute("payout", payout.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout),
+                }],
+            });
+    } else if dealer_rank > player_rank {
+        // 庄家赢
+        response = response
+            .add_attribute("result", "dealer_win")
+            .add_attribute("payout", "0");
+    } else {
+        // 平局：退还下注额
+        global_state.locked_amount = global_state.locked_amount.saturating_sub(total_bet);
+        response = response
+            .add_attribute("result", "tie")
+            .add_attribute("payout", total_bet.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(total_bet),
+                }],
+            });
+    }
+
+    state.finished = true;
+    TEXAS_STATE.save(deps.storage, &info.sender, &state)?;
+    STATE.save(deps.storage, &global_state)?;
+
+    Ok(response)
+}
+
+/// 德州扑克阶段推进
+fn advance_texas_stage(state: &TexasState) -> (TexasStage, Vec<texas::Card>) {
+    let deck = &state.deck;
+    match state.stage {
+        TexasStage::PreFlop => {
+            // Flop: 揭示 3 张公共牌 (deck[4..7])
+            let community = (4..7).map(|i| texas::Card::from_id(deck[i])).collect();
+            (TexasStage::Flop, community)
+        }
+        TexasStage::Flop => {
+            // Turn: 揭示 4 张 (deck[4..8])
+            let community = (4..8).map(|i| texas::Card::from_id(deck[i])).collect();
+            (TexasStage::Turn, community)
+        }
+        TexasStage::Turn => {
+            // River: 揭示全部 5 张 (deck[4..9])
+            let community = (4..9).map(|i| texas::Card::from_id(deck[i])).collect();
+            (TexasStage::River, community)
+        }
+        TexasStage::River | TexasStage::Showdown => {
+            let community = state.community_cards.clone();
+            (TexasStage::Showdown, community)
+        }
+    }
+}
+
+/// 德州扑克洗牌（使用不同盐与奥马哈区分）
+fn shuffle_texas_deck(info: &MessageInfo, env: &Env) -> Vec<u8> {
+    let mut deck: Vec<u8> = (0u8..52).collect();
+    let mut weights: Vec<u32> = (0u8..52)
+        .map(|i| {
+            let salt = format!("texas_deck_{}", i);
+            utils::generate_random_number(info, env, salt.as_bytes())
+        })
+        .collect();
+
+    for i in (1..52usize).rev() {
+        let j = (weights[i] as usize + i * 97) % (i + 1);
+        deck.swap(i, j);
+        weights.swap(i, j);
+    }
+    deck
+}
+
+/// 格式化德州扑克 Card 列表为可读字符串
+fn format_texas_cards(cards: &[texas::Card]) -> String {
+    let parts: Vec<String> = cards
+        .iter()
+        .map(|c| {
+            let rank_str = match c.rank {
+                11 => "J".to_string(),
+                12 => "Q".to_string(),
+                13 => "K".to_string(),
+                14 => "A".to_string(),
+                n => n.to_string(),
+            };
+            let suit_str = match c.suit {
+                texas::Suit::Spades   => "♠",
+                texas::Suit::Hearts   => "♥",
+                texas::Suit::Diamonds => "♦",
+                texas::Suit::Clubs    => "♣",
+            };
+            format!("{}{}", rank_str, suit_str)
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 三公（San Gong / Three Face Cards）
+//
+// 单局游戏：下注后双方各发 3 张牌，直接比较牌力
+// 牌型：三公 > 混合九 > 普通点数 9 > ... > 0
+// 赔率：三公赢 3×，混合九/普通赢 2×，平局退还本金
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_sangong(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+    // 检查下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 更新合约锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+
+    // 洗牌并发牌：玩家 3 张 + 庄家 3 张
+    let deck = shuffle_sangong_deck(&info, &env);
+    let player_cards: [SanGongCard; 3] = [
+        SanGongCard::from_id(deck[0]),
+        SanGongCard::from_id(deck[1]),
+        SanGongCard::from_id(deck[2]),
+    ];
+    let dealer_cards: [SanGongCard; 3] = [
+        SanGongCard::from_id(deck[3]),
+        SanGongCard::from_id(deck[4]),
+        SanGongCard::from_id(deck[5]),
+    ];
+
+    // 评估双方牌力
+    let player_rank = evaluate_sangong_hand(&player_cards);
+    let dealer_rank = evaluate_sangong_hand(&dealer_cards);
+
+    let player_type_name = hand_type_name(&player_rank.hand_type);
+    let dealer_type_name = hand_type_name(&dealer_rank.hand_type);
+
+    let player_points = match &player_rank.hand_type {
+        SanGongHandType::SanGong => 10,     // 显示用
+        SanGongHandType::MixedNine => 9,
+        SanGongHandType::Normal { points } => *points,
+    };
+    let dealer_points = match &dealer_rank.hand_type {
+        SanGongHandType::SanGong => 10,
+        SanGongHandType::MixedNine => 9,
+        SanGongHandType::Normal { points } => *points,
+    };
+
+    let mut response = Response::new()
+        .add_attribute("action", "play_sangong")
+        .add_attribute("player_cards", format_sangong_cards(&player_cards))
+        .add_attribute("dealer_cards", format_sangong_cards(&dealer_cards))
+        .add_attribute("player_hand_type", player_type_name)
+        .add_attribute("dealer_hand_type", dealer_type_name)
+        .add_attribute("player_points", player_points.to_string())
+        .add_attribute("dealer_points", dealer_points.to_string())
+        .add_attribute("player_score", player_rank.score.to_string())
+        .add_attribute("dealer_score", dealer_rank.score.to_string());
+
+    if player_rank.score > dealer_rank.score {
+        // 玩家赢
+        let multiplier = sangong_payout_multiplier(&player_rank.hand_type);
+        let payout = bet * multiplier;
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout);
+        response = response
+            .add_attribute("result", "win")
+            .add_attribute("payout_multiplier", multiplier.to_string())
+            .add_attribute("payout", payout.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout),
+                }],
+            });
+    } else if dealer_rank.score > player_rank.score {
+        // 庄家赢
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    } else {
+        // 平局，退还本金
+        state.locked_amount = state.locked_amount.saturating_sub(bet);
+        response = response
+            .add_attribute("result", "tie")
+            .add_attribute("payout", bet.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(bet),
+                }],
+            });
+    }
+
+    STATE.save(deps.storage, &state)?;
+    Ok(response)
+}
+
+/// 三公洗牌
+fn shuffle_sangong_deck(info: &MessageInfo, env: &Env) -> Vec<u8> {
+    let mut deck: Vec<u8> = (0u8..52).collect();
+    let mut weights: Vec<u32> = (0u8..52)
+        .map(|i| {
+            let salt = format!("sangong_deck_{}", i);
+            utils::generate_random_number(info, env, salt.as_bytes())
+        })
+        .collect();
+
+    for i in (1..52usize).rev() {
+        let j = (weights[i] as usize + i * 97) % (i + 1);
+        deck.swap(i, j);
+        weights.swap(i, j);
+    }
+    deck
+}
+
+/// 格式化三公牌面
+fn format_sangong_cards(cards: &[SanGongCard]) -> String {
+    let parts: Vec<String> = cards
+        .iter()
+        .map(|c| {
+            let rank_str = match c.rank {
+                1 => "A".to_string(),
+                11 => "J".to_string(),
+                12 => "Q".to_string(),
+                13 => "K".to_string(),
+                n => n.to_string(),
+            };
+            let suit_str = match c.suit {
+                sangong::Suit::Spades   => "♠",
+                sangong::Suit::Hearts   => "♥",
+                sangong::Suit::Diamonds => "♦",
+                sangong::Suit::Clubs    => "♣",
+            };
+            format!("{}{}", rank_str, suit_str)
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 骰宝（Sic Bo）
+//
+// 单局游戏：下注后摇三颗骰子，根据投注类型判定输赢
+// 投注类型：大/小、单/双、总和、三同号通选、指定三同号、双骰、单骰、两骰组合
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_sicbo(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    bet_type: SicBoBetType,
+) -> StdResult<Response> {
+    // 验证投注参数
+    if let Err(e) = validate_bet(&bet_type) {
+        return Err(StdError::generic_err(e));
+    }
+
+    // 检查下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 更新合约锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+
+    // 摇三颗骰子（每颗 1-6）
+    let die1 = (utils::generate_random_number(&info, &env, b"sicbo_die1") % 6 + 1) as u8;
+    let die2 = (utils::generate_random_number(&info, &env, b"sicbo_die2") % 6 + 1) as u8;
+    let die3 = (utils::generate_random_number(&info, &env, b"sicbo_die3") % 6 + 1) as u8;
+
+    let result = SicBoResult::new(die1, die2, die3);
+
+    // 计算赔付
+    let (won, multiplier) = calculate_sicbo_payout(&bet_type, &result);
+
+    let mut response = Response::new()
+        .add_attribute("action", "play_sicbo")
+        .add_attribute("die1", die1.to_string())
+        .add_attribute("die2", die2.to_string())
+        .add_attribute("die3", die3.to_string())
+        .add_attribute("total", result.total.to_string())
+        .add_attribute("is_triple", result.is_triple.to_string())
+        .add_attribute("bet_type", format!("{:?}", bet_type));
+
+    if won {
+        let payout = bet * multiplier;
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout);
+        response = response
+            .add_attribute("result", "win")
+            .add_attribute("payout_multiplier", multiplier.to_string())
+            .add_attribute("payout", payout.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout),
+                }],
+            });
+    } else {
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    }
+
+    STATE.save(deps.storage, &state)?;
+    Ok(response)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 基诺（Keno）
+//
+// 单局游戏：玩家选 1-10 个号码（1-80），系统随机开出 20 个号码
+// 命中越多赔率越高，选 10 中 10 最高赔 2000×
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_keno(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    picks: Vec<u8>,
+) -> StdResult<Response> {
+    // 验证选号
+    if let Err(e) = validate_picks(&picks) {
+        return Err(StdError::generic_err(e));
+    }
+
+    // 检查下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 更新合约锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+
+    // 从 1-80 中随机抽取 20 个不重复号码
+    let drawn = draw_keno_numbers(&info, &env);
+
+    // 计算命中
+    let hits = calculate_hits(&picks, &drawn);
+    let hit_count = hits.len() as u8;
+    let pick_count = picks.len() as u8;
+
+    // 计算赔率
+    let multiplier = keno_payout_multiplier(pick_count, hit_count);
+
+    let drawn_str: Vec<String> = drawn.iter().map(|n| n.to_string()).collect();
+    let picks_str: Vec<String> = picks.iter().map(|n| n.to_string()).collect();
+    let hits_str: Vec<String> = hits.iter().map(|n| n.to_string()).collect();
+
+    let mut response = Response::new()
+        .add_attribute("action", "play_keno")
+        .add_attribute("picks", format!("[{}]", picks_str.join(",")))
+        .add_attribute("drawn", format!("[{}]", drawn_str.join(",")))
+        .add_attribute("hits", format!("[{}]", hits_str.join(",")))
+        .add_attribute("pick_count", pick_count.to_string())
+        .add_attribute("hit_count", hit_count.to_string());
+
+    if multiplier > 0 {
+        let payout = bet * multiplier;
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout);
+        response = response
+            .add_attribute("result", "win")
+            .add_attribute("payout_multiplier", multiplier.to_string())
+            .add_attribute("payout", payout.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout),
+                }],
+            });
+    } else {
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    }
+
+    STATE.save(deps.storage, &state)?;
+    Ok(response)
+}
+
+/// 从 1-80 中随机抽取 20 个不重复号码
+fn draw_keno_numbers(info: &MessageInfo, env: &Env) -> Vec<u8> {
+    // 生成 1-80 的号码池
+    let mut pool: Vec<u8> = (1u8..=80).collect();
+
+    // Fisher-Yates 洗牌（只需前 20 个位置）
+    for i in 0..20usize {
+        let salt = format!("keno_draw_{}", i);
+        let rand = utils::generate_random_number(info, env, salt.as_bytes()) as usize;
+        let j = i + (rand % (80 - i));
+        pool.swap(i, j);
+    }
+
+    // 取前 20 个并排序（便于展示）
+    let mut drawn: Vec<u8> = pool[..20].to_vec();
+    drawn.sort_unstable();
+    drawn
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 刮刮乐（Scratch Card）
+//
+// 单局游戏：购买一张 3×3 的刮刮卡，刮开后检查 8 条中奖线
+// 同行/同列/对角线三个相同符号即中奖，多线可叠加
+// 符号：💎(50×) ⭐(20×) 🍀(10×) 🔔(5×) 🍒(3×) 🍋(2×)
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_scratch_card(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    card_type: ScratchCardType,
+) -> StdResult<Response> {
+    // 检查下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    let (min_bet, max_bet) = scratch_bet_range(&card_type);
+    if bet < min_bet || bet > max_bet {
+        return Err(StdError::generic_err(format!(
+            "Bet must be between {} and {} uatom for {:?} card",
+            min_bet, max_bet, card_type
+        )));
+    }
+
+    // 更新合约锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+
+    // 生成 3×3 = 9 格符号
+    let mut grid = [ScratchSymbol::Lemon; 9];
+    for i in 0..9usize {
+        let salt = format!("scratch_cell_{}", i);
+        let rand = utils::generate_random_number(&info, &env, salt.as_bytes());
+        grid[i] = ScratchSymbol::from_rand(rand);
+    }
+
+    // 评估中奖
+    let (total_multiplier, winning_lines) = evaluate_scratch_card(&grid);
+
+    // 构建格子展示
+    let mut response = Response::new()
+        .add_attribute("action", "play_scratch_card")
+        .add_attribute("card_type", format!("{:?}", card_type))
+        .add_attribute("bet_amount", bet.to_string());
+
+    // 输出 3×3 格子
+    for row in 0..3usize {
+        for col in 0..3usize {
+            let idx = row * 3 + col;
+            let key = format!("cell_{}_{}", row + 1, col + 1);
+            response = response.add_attribute(key, grid[idx].name());
+        }
+    }
+
+    // 输出格子 emoji 行（便于阅读）
+    for row in 0..3usize {
+        let row_str: Vec<&str> = (0..3)
+            .map(|col| grid[row * 3 + col].emoji())
+            .collect();
+        response = response.add_attribute(
+            format!("row_{}", row + 1),
+            row_str.join(" "),
+        );
+    }
+
+    // 中奖线数
+    let win_count = winning_lines.len() as u32;
+    response = response.add_attribute("winning_lines", win_count.to_string());
+
+    if total_multiplier > 0 {
+        // 有中奖
+        let payout = bet * total_multiplier;
+
+        // 输出每条中奖线
+        let win_desc: Vec<String> = winning_lines
+            .iter()
+            .map(|(line, sym)| format!("{}:{}", line, sym.name()))
+            .collect();
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout);
+        response = response
+            .add_attribute("result", "win")
+            .add_attribute("win_desc", win_desc.join(","))
+            .add_attribute("total_multiplier", total_multiplier.to_string())
+            .add_attribute("payout", payout.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout),
+                }],
+            });
+    } else {
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    }
+
+    STATE.save(deps.storage, &state)?;
+    Ok(response)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 斗牛（Bull Bull / Niu Niu）
+//
+// 单局游戏：双方各发 5 张牌，比较牌型
+// 特殊牌型：五小牛(8×) > 四炸(7×) > 五花牛(6×) > 牛牛(4×) > 牛9/8(3×) > 牛1-7(2×) > 没牛(2×)
+// ──────────────────────────────────────────────────────────────────────────────
+fn play_bullfight(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+    // 检查下注金额
+    let bet = info
+        .funds
+        .iter()
+        .find(|c| c.denom == "uatom")
+        .map(|c| c.amount.u128())
+        .unwrap_or(0);
+
+    if bet < 100_000 || bet > 10_000_000 {
+        return Err(StdError::generic_err(
+            "Bet must be between 100,000 and 10,000,000 uatom",
+        ));
+    }
+
+    // 更新合约锁仓金额
+    let mut state = STATE.load(deps.storage)?;
+    state.locked_amount += bet;
+
+    // 洗牌并发牌：玩家 5 张 + 庄家 5 张
+    let deck = shuffle_bullfight_deck(&info, &env);
+    let player_cards: [BullCard; 5] = [
+        BullCard::from_id(deck[0]),
+        BullCard::from_id(deck[1]),
+        BullCard::from_id(deck[2]),
+        BullCard::from_id(deck[3]),
+        BullCard::from_id(deck[4]),
+    ];
+    let dealer_cards: [BullCard; 5] = [
+        BullCard::from_id(deck[5]),
+        BullCard::from_id(deck[6]),
+        BullCard::from_id(deck[7]),
+        BullCard::from_id(deck[8]),
+        BullCard::from_id(deck[9]),
+    ];
+
+    // 评估双方牌力
+    let player_rank = evaluate_bull_hand(&player_cards);
+    let dealer_rank = evaluate_bull_hand(&dealer_cards);
+
+    let player_type_name = bull_hand_type_name(&player_rank.hand_type);
+    let dealer_type_name = bull_hand_type_name(&dealer_rank.hand_type);
+
+    let mut response = Response::new()
+        .add_attribute("action", "play_bullfight")
+        .add_attribute("player_cards", format_bull_cards(&player_cards))
+        .add_attribute("dealer_cards", format_bull_cards(&dealer_cards))
+        .add_attribute("player_hand_type", player_type_name)
+        .add_attribute("dealer_hand_type", dealer_type_name)
+        .add_attribute("player_score", player_rank.score.to_string())
+        .add_attribute("dealer_score", dealer_rank.score.to_string());
+
+    if player_rank.score > dealer_rank.score {
+        // 玩家赢
+        let multiplier = bull_payout_multiplier(&player_rank.hand_type);
+        let payout = bet * multiplier;
+
+        state.locked_amount = state.locked_amount.saturating_sub(payout);
+        response = response
+            .add_attribute("result", "win")
+            .add_attribute("payout_multiplier", multiplier.to_string())
+            .add_attribute("payout", payout.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(payout),
+                }],
+            });
+    } else if dealer_rank.score > player_rank.score {
+        // 庄家赢
+        response = response
+            .add_attribute("result", "lose")
+            .add_attribute("payout", "0");
+    } else {
+        // 平局，退还本金
+        state.locked_amount = state.locked_amount.saturating_sub(bet);
+        response = response
+            .add_attribute("result", "tie")
+            .add_attribute("payout", bet.to_string())
+            .add_message(BankMsg::Send {
+                to_address: info.sender.to_string(),
+                amount: vec![Coin {
+                    denom: "uatom".to_string(),
+                    amount: Uint128::from(bet),
+                }],
+            });
+    }
+
+    STATE.save(deps.storage, &state)?;
+    Ok(response)
+}
+
+/// 斗牛洗牌
+fn shuffle_bullfight_deck(info: &MessageInfo, env: &Env) -> Vec<u8> {
+    let mut deck: Vec<u8> = (0u8..52).collect();
+    let mut weights: Vec<u32> = (0u8..52)
+        .map(|i| {
+            let salt = format!("bullfight_deck_{}", i);
+            utils::generate_random_number(info, env, salt.as_bytes())
+        })
+        .collect();
+
+    for i in (1..52usize).rev() {
+        let j = (weights[i] as usize + i * 97) % (i + 1);
+        deck.swap(i, j);
+        weights.swap(i, j);
+    }
+    deck
+}
+
+/// 格式化斗牛牌面
+fn format_bull_cards(cards: &[BullCard]) -> String {
+    let parts: Vec<String> = cards
+        .iter()
+        .map(|c| {
+            let rank_str = match c.rank {
+                1 => "A".to_string(),
+                11 => "J".to_string(),
+                12 => "Q".to_string(),
+                13 => "K".to_string(),
+                n => n.to_string(),
+            };
+            let suit_str = match c.suit {
+                bullfight::Suit::Spades   => "♠",
+                bullfight::Suit::Hearts   => "♥",
+                bullfight::Suit::Diamonds => "♦",
+                bullfight::Suit::Clubs    => "♣",
+            };
+            format!("{}{}", rank_str, suit_str)
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2616,5 +3708,1582 @@ mod tests {
         // 验证 player_rank_name 和 dealer_rank_name 存在
         assert!(sd.attributes.iter().any(|a| a.key == "player_rank_name"));
         assert!(sd.attributes.iter().any(|a| a.key == "dealer_rank_name"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 德州扑克（Texas Hold'em）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_texas_full_flow() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "texas_player";
+        let bet = 500_000u128;
+
+        // ── Step 1: Start ──────────────────────────────────────
+        let start_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(bet, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        ).unwrap();
+
+        let stage = start_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(stage.value, "PreFlop");
+
+        let player_hand_attr = start_res.attributes.iter().find(|a| a.key == "player_hand").unwrap();
+        assert!(!player_hand_attr.value.is_empty(), "player_hand should not be empty");
+
+        // ── Step 2: Query state ────────────────────────────────
+        let bin = query(
+            deps.as_ref(), mock_env(),
+            QueryMsg::GetTexasState { address: player.to_string() },
+        ).unwrap();
+        let state_resp: TexasStateResponse = from_json(&bin).unwrap();
+        assert_eq!(state_resp.player_hand.len(), 2, "player should have 2 cards");
+        assert_eq!(state_resp.dealer_hand.len(), 0, "dealer hand hidden before showdown");
+        assert_eq!(state_resp.community_cards.len(), 0, "no community cards at PreFlop");
+        assert!(!state_resp.finished);
+        assert!(!state_resp.all_in);
+
+        // ── Step 3: Raise (PreFlop → Flop) ───────────────────
+        let raise_amount = 200_000u128;
+        let raise_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(raise_amount, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Raise { amount: raise_amount } },
+        ).unwrap();
+
+        let raise_stage = raise_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(raise_stage.value, "Flop");
+
+        let community_attr = raise_res.attributes.iter().find(|a| a.key == "community_cards").unwrap();
+        assert!(community_attr.value.contains(","), "flop should have 3 cards");
+
+        // ── Step 4: Call (Flop → Turn) ────────────────────────
+        let call_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Call },
+        ).unwrap();
+        let call_stage = call_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(call_stage.value, "Turn");
+
+        // ── Step 5: Showdown ──────────────────────────────────
+        let showdown_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Showdown },
+        ).unwrap();
+
+        let result = showdown_res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        assert!(
+            result.value == "player_win" || result.value == "dealer_win" || result.value == "tie",
+            "unexpected result: {}",
+            result.value
+        );
+
+        // Showdown 后庄家手牌应可见
+        let bin2 = query(
+            deps.as_ref(), mock_env(),
+            QueryMsg::GetTexasState { address: player.to_string() },
+        ).unwrap();
+        let final_state: TexasStateResponse = from_json(&bin2).unwrap();
+        assert!(final_state.finished);
+        assert_eq!(final_state.dealer_hand.len(), 2, "dealer hand visible after showdown");
+        assert_eq!(final_state.community_cards.len(), 5, "all 5 community cards after showdown");
+    }
+
+    #[test]
+    fn test_texas_fold() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "texas_fold_player";
+        let bet = 300_000u128;
+
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(bet, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        ).unwrap();
+
+        // 弃牌
+        let fold_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Fold },
+        ).unwrap();
+
+        let result = fold_res.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert_eq!(result.value, "folded");
+
+        // 弃牌后不能再操作
+        let err = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Showdown },
+        );
+        assert!(err.is_err(), "should not be able to showdown after fold");
+    }
+
+    #[test]
+    fn test_texas_no_duplicate_game() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "texas_dup_player";
+
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(100_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        ).unwrap();
+
+        // 重复开始应报错
+        let err = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(100_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        );
+        assert!(err.is_err(), "should not allow duplicate active game");
+    }
+
+    #[test]
+    fn test_texas_check_advance() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "texas_check_player";
+
+        // Start
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(500_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        ).unwrap();
+
+        // Check (PreFlop → Flop) — 差额为 0，可以过牌
+        let check_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Check },
+        ).unwrap();
+        let check_stage = check_res.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(check_stage.value, "Flop");
+
+        // Check (Flop → Turn)
+        let check2 = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Check },
+        ).unwrap();
+        let check2_stage = check2.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(check2_stage.value, "Turn");
+
+        // Check (Turn → River)
+        let check3 = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Check },
+        ).unwrap();
+        let check3_stage = check3.attributes.iter().find(|a| a.key == "stage").unwrap();
+        assert_eq!(check3_stage.value, "River");
+
+        // Showdown
+        let sd = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Showdown },
+        ).unwrap();
+        let result = sd.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert!(
+            ["player_win", "dealer_win", "tie"].contains(&result.value.as_str()),
+            "unexpected result: {}",
+            result.value
+        );
+    }
+
+    #[test]
+    fn test_texas_all_in() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "texas_allin_player";
+
+        // Start
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(500_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        ).unwrap();
+
+        // All-In 直接进入 Showdown
+        let allin_res = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(2_000_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::AllIn { amount: 2_000_000 } },
+        ).unwrap();
+
+        let result = allin_res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        assert!(
+            ["player_win", "dealer_win", "tie"].contains(&result.value.as_str()),
+            "unexpected result: {}",
+            result.value
+        );
+
+        // 验证 rank_name 属性存在
+        assert!(allin_res.attributes.iter().any(|a| a.key == "player_rank_name"));
+        assert!(allin_res.attributes.iter().any(|a| a.key == "dealer_rank_name"));
+
+        // 验证游戏已结束
+        let bin = query(
+            deps.as_ref(), mock_env(),
+            QueryMsg::GetTexasState { address: player.to_string() },
+        ).unwrap();
+        let final_state: TexasStateResponse = from_json(&bin).unwrap();
+        assert!(final_state.finished);
+        assert!(final_state.all_in);
+        assert_eq!(final_state.community_cards.len(), 5);
+        assert_eq!(final_state.dealer_hand.len(), 2);
+    }
+
+    #[test]
+    fn test_texas_raise_then_showdown() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let player = "texas_raise_player";
+
+        // Start
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(500_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Start },
+        ).unwrap();
+
+        // Raise 1: PreFlop → Flop
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(100_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Raise { amount: 100_000 } },
+        ).unwrap();
+
+        // Raise 2: Flop → Turn
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(200_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Raise { amount: 200_000 } },
+        ).unwrap();
+
+        // Raise 3: Turn → River
+        execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(300_000, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Raise { amount: 300_000 } },
+        ).unwrap();
+
+        // Showdown
+        let sd = execute(
+            deps.as_mut(), mock_env(),
+            mock_info(player, &coins(0, "uatom")),
+            ExecuteMsg::PlayTexas { action: TexasAction::Showdown },
+        ).unwrap();
+
+        let result = sd.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert!(
+            ["player_win", "dealer_win", "tie"].contains(&result.value.as_str()),
+            "unexpected result: {}",
+            result.value
+        );
+
+        assert!(sd.attributes.iter().any(|a| a.key == "player_rank_name"));
+        assert!(sd.attributes.iter().any(|a| a.key == "dealer_rank_name"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 三公（San Gong）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_play_sangong() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sangong_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info.clone(),
+            ExecuteMsg::PlaySanGong {},
+        )
+        .unwrap();
+
+        // 检查基本属性
+        let action = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "action")
+            .expect("action missing");
+        assert_eq!(action.value, "play_sangong");
+
+        assert!(
+            res.attributes.iter().any(|a| a.key == "player_cards"),
+            "player_cards missing"
+        );
+        assert!(
+            res.attributes.iter().any(|a| a.key == "dealer_cards"),
+            "dealer_cards missing"
+        );
+        assert!(
+            res.attributes.iter().any(|a| a.key == "player_hand_type"),
+            "player_hand_type missing"
+        );
+        assert!(
+            res.attributes.iter().any(|a| a.key == "dealer_hand_type"),
+            "dealer_hand_type missing"
+        );
+        assert!(
+            res.attributes.iter().any(|a| a.key == "player_points"),
+            "player_points missing"
+        );
+        assert!(
+            res.attributes.iter().any(|a| a.key == "dealer_points"),
+            "dealer_points missing"
+        );
+
+        let result = res
+            .attributes
+            .iter()
+            .find(|a| a.key == "result")
+            .expect("result missing");
+
+        if result.value == "win" {
+            assert_eq!(res.messages.len(), 1, "should have payout message on win");
+            // 检查 payout_multiplier 属性存在
+            let mult = res
+                .attributes
+                .iter()
+                .find(|a| a.key == "payout_multiplier")
+                .expect("payout_multiplier missing");
+            let mult_val: u128 = mult.value.parse().unwrap();
+            assert!(
+                mult_val >= 2 && mult_val <= 3,
+                "multiplier should be 2 or 3, got {}",
+                mult_val
+            );
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(1_000_000 * mult_val, "uatom"),
+                }
+                .into()
+            );
+        } else if result.value == "tie" {
+            // 平局退还本金
+            assert_eq!(res.messages.len(), 1, "should refund on tie");
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(1_000_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(result.value, "lose");
+            assert_eq!(res.messages.len(), 0, "should have no payout on loss");
+        }
+    }
+
+    #[test]
+    fn test_sangong_bet_limits() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        // 低于最小下注
+        let too_small = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(50_000, "uatom")),
+            ExecuteMsg::PlaySanGong {},
+        );
+        assert!(too_small.is_err(), "should reject bet below 100,000");
+
+        // 高于最大下注
+        let too_big = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(20_000_000, "uatom")),
+            ExecuteMsg::PlaySanGong {},
+        );
+        assert!(too_big.is_err(), "should reject bet above 10,000,000");
+    }
+
+    #[test]
+    fn test_sangong_hand_evaluation() {
+        use crate::sangong::{evaluate_sangong_hand, SanGongCard, SanGongHandType, Suit};
+
+        // 三公：三张全是公牌 (K, Q, J)
+        let san_gong = [
+            SanGongCard { rank: 13, suit: Suit::Spades },
+            SanGongCard { rank: 12, suit: Suit::Hearts },
+            SanGongCard { rank: 11, suit: Suit::Diamonds },
+        ];
+        let rank = evaluate_sangong_hand(&san_gong);
+        assert_eq!(rank.hand_type, SanGongHandType::SanGong);
+        assert!(rank.score >= 30_000, "san gong should have highest score");
+
+        // 混合九：含公牌且点数为 9（K + 4 + 5 = 0+4+5 = 9）
+        let mixed_nine = [
+            SanGongCard { rank: 13, suit: Suit::Spades },
+            SanGongCard { rank: 4, suit: Suit::Hearts },
+            SanGongCard { rank: 5, suit: Suit::Diamonds },
+        ];
+        let rank2 = evaluate_sangong_hand(&mixed_nine);
+        assert_eq!(rank2.hand_type, SanGongHandType::MixedNine);
+        assert!(rank2.score >= 20_000 && rank2.score < 30_000);
+
+        // 普通 7 点 (3 + 2 + 2 = 7)
+        let normal = [
+            SanGongCard { rank: 3, suit: Suit::Spades },
+            SanGongCard { rank: 2, suit: Suit::Hearts },
+            SanGongCard { rank: 2, suit: Suit::Diamonds },
+        ];
+        let rank3 = evaluate_sangong_hand(&normal);
+        assert_eq!(rank3.hand_type, SanGongHandType::Normal { points: 7 });
+        assert!(rank3.score < 20_000);
+
+        // 三公 > 混合九 > 普通
+        assert!(rank.score > rank2.score);
+        assert!(rank2.score > rank3.score);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 骰宝（Sic Bo）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_play_sicbo_big() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sicbo_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Big,
+            },
+        )
+        .unwrap();
+
+        // 检查基本属性
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "action").unwrap().value,
+            "play_sicbo"
+        );
+        assert!(res.attributes.iter().any(|a| a.key == "die1"));
+        assert!(res.attributes.iter().any(|a| a.key == "die2"));
+        assert!(res.attributes.iter().any(|a| a.key == "die3"));
+        assert!(res.attributes.iter().any(|a| a.key == "total"));
+        assert!(res.attributes.iter().any(|a| a.key == "is_triple"));
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        let total: u8 = res.attributes.iter().find(|a| a.key == "total").unwrap().value.parse().unwrap();
+        let is_triple: bool = res.attributes.iter().find(|a| a.key == "is_triple").unwrap().value.parse().unwrap();
+
+        if result.value == "win" {
+            assert!(total >= 11 && total <= 17 && !is_triple, "Big win requires total 11-17, no triple");
+            assert_eq!(res.messages.len(), 1);
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(2_000_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_sicbo_small() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sicbo_small_player";
+        let user_info = mock_info(user, &coins(500_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Small,
+            },
+        )
+        .unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        let total: u8 = res.attributes.iter().find(|a| a.key == "total").unwrap().value.parse().unwrap();
+        let is_triple: bool = res.attributes.iter().find(|a| a.key == "is_triple").unwrap().value.parse().unwrap();
+
+        if result.value == "win" {
+            assert!(total >= 4 && total <= 10 && !is_triple, "Small win requires total 4-10, no triple");
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(1_000_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_sicbo_total() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sicbo_total_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Total { value: 10 },
+            },
+        )
+        .unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        let total: u8 = res.attributes.iter().find(|a| a.key == "total").unwrap().value.parse().unwrap();
+
+        if result.value == "win" {
+            assert_eq!(total, 10);
+            // 总和 10 赔率 7×
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(7_000_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_sicbo_any_triple() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sicbo_triple_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::AnyTriple,
+            },
+        )
+        .unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+        let is_triple: bool = res.attributes.iter().find(|a| a.key == "is_triple").unwrap().value.parse().unwrap();
+
+        if result.value == "win" {
+            assert!(is_triple, "AnyTriple win requires all three dice the same");
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(31_000_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_sicbo_single_die() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sicbo_single_player";
+        let bet = 1_000_000u128;
+        let user_info = mock_info(user, &coins(bet, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::SingleDie { number: 3 },
+            },
+        )
+        .unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            let payout_mult: u128 = res.attributes.iter()
+                .find(|a| a.key == "payout_multiplier")
+                .unwrap()
+                .value.parse().unwrap();
+            assert!(payout_mult >= 2 && payout_mult <= 4, "single die multiplier 2-4");
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet * payout_mult, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_sicbo_combo() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "sicbo_combo_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Combo { first: 1, second: 6 },
+            },
+        )
+        .unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(7_000_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_sicbo_bet_validation() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        // 总和超出范围
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Total { value: 20 },
+            },
+        );
+        assert!(err.is_err(), "should reject total > 17");
+
+        let err2 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Total { value: 2 },
+            },
+        );
+        assert!(err2.is_err(), "should reject total < 4");
+
+        // 骰子点数超出范围
+        let err3 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::SingleDie { number: 7 },
+            },
+        );
+        assert!(err3.is_err(), "should reject die number > 6");
+
+        // 两骰组合相同数字
+        let err4 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Combo { first: 3, second: 3 },
+            },
+        );
+        assert!(err4.is_err(), "should reject combo with same numbers");
+
+        // 下注金额过小
+        let err5 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(50_000, "uatom")),
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Big,
+            },
+        );
+        assert!(err5.is_err(), "should reject bet below 100,000");
+
+        // 下注金额过大
+        let err6 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(20_000_000, "uatom")),
+            ExecuteMsg::PlaySicBo {
+                bet_type: SicBoBetType::Big,
+            },
+        );
+        assert!(err6.is_err(), "should reject bet above 10,000,000");
+    }
+
+    #[test]
+    fn test_sicbo_payout_logic() {
+        use crate::sicbo::{calculate_sicbo_payout, SicBoBetType, SicBoResult};
+
+        // 大：总和 12，非三同号 → 赢
+        let r = SicBoResult::new(4, 4, 4); // triple 12
+        let (won, _) = calculate_sicbo_payout(&SicBoBetType::Big, &r);
+        assert!(!won, "triple should lose Big bet");
+
+        let r2 = SicBoResult::new(3, 4, 5); // total 12, no triple
+        let (won2, mult2) = calculate_sicbo_payout(&SicBoBetType::Big, &r2);
+        assert!(won2, "total 12 no triple should win Big");
+        assert_eq!(mult2, 2);
+
+        // 小：总和 8，非三同号 → 赢
+        let r3 = SicBoResult::new(1, 3, 4); // total 8
+        let (won3, mult3) = calculate_sicbo_payout(&SicBoBetType::Small, &r3);
+        assert!(won3);
+        assert_eq!(mult3, 2);
+
+        // 单双
+        let r4 = SicBoResult::new(1, 2, 4); // total 7 (odd)
+        let (odd_won, _) = calculate_sicbo_payout(&SicBoBetType::Odd, &r4);
+        assert!(odd_won);
+        let (even_won, _) = calculate_sicbo_payout(&SicBoBetType::Even, &r4);
+        assert!(!even_won);
+
+        // 指定三同号
+        let r5 = SicBoResult::new(6, 6, 6);
+        let (triple_won, triple_mult) = calculate_sicbo_payout(
+            &SicBoBetType::SpecificTriple { number: 6 },
+            &r5,
+        );
+        assert!(triple_won);
+        assert_eq!(triple_mult, 181);
+
+        let (wrong_triple, _) = calculate_sicbo_payout(
+            &SicBoBetType::SpecificTriple { number: 5 },
+            &r5,
+        );
+        assert!(!wrong_triple);
+
+        // 双骰
+        let r6 = SicBoResult::new(3, 3, 5);
+        let (double_won, double_mult) = calculate_sicbo_payout(
+            &SicBoBetType::DoubleBet { number: 3 },
+            &r6,
+        );
+        assert!(double_won);
+        assert_eq!(double_mult, 12);
+
+        // 单骰：出现 1 次
+        let r7 = SicBoResult::new(2, 4, 6);
+        let (single_won, single_mult) = calculate_sicbo_payout(
+            &SicBoBetType::SingleDie { number: 4 },
+            &r7,
+        );
+        assert!(single_won);
+        assert_eq!(single_mult, 2);
+
+        // 单骰：出现 2 次
+        let r8 = SicBoResult::new(4, 4, 6);
+        let (s2_won, s2_mult) = calculate_sicbo_payout(
+            &SicBoBetType::SingleDie { number: 4 },
+            &r8,
+        );
+        assert!(s2_won);
+        assert_eq!(s2_mult, 3);
+
+        // 两骰组合
+        let r9 = SicBoResult::new(1, 3, 6);
+        let (combo_won, combo_mult) = calculate_sicbo_payout(
+            &SicBoBetType::Combo { first: 1, second: 6 },
+            &r9,
+        );
+        assert!(combo_won);
+        assert_eq!(combo_mult, 7);
+
+        let (combo_fail, _) = calculate_sicbo_payout(
+            &SicBoBetType::Combo { first: 2, second: 5 },
+            &r9,
+        );
+        assert!(!combo_fail);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 基诺（Keno）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_play_keno_basic() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "keno_player";
+        let bet = 1_000_000u128;
+        let user_info = mock_info(user, &coins(bet, "uatom"));
+
+        // 选 5 个号码
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayKeno {
+                picks: vec![3, 17, 28, 42, 65],
+            },
+        )
+        .unwrap();
+
+        // 检查基本属性
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "action").unwrap().value,
+            "play_keno"
+        );
+        assert!(res.attributes.iter().any(|a| a.key == "picks"));
+        assert!(res.attributes.iter().any(|a| a.key == "drawn"));
+        assert!(res.attributes.iter().any(|a| a.key == "hits"));
+        assert!(res.attributes.iter().any(|a| a.key == "pick_count"));
+        assert!(res.attributes.iter().any(|a| a.key == "hit_count"));
+
+        let pick_count: u8 = res
+            .attributes.iter().find(|a| a.key == "pick_count").unwrap()
+            .value.parse().unwrap();
+        assert_eq!(pick_count, 5);
+
+        let hit_count: u8 = res
+            .attributes.iter().find(|a| a.key == "hit_count").unwrap()
+            .value.parse().unwrap();
+        assert!(hit_count <= 5);
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            assert!(res.messages.len() == 1);
+            let mult: u128 = res.attributes.iter()
+                .find(|a| a.key == "payout_multiplier").unwrap()
+                .value.parse().unwrap();
+            assert!(mult > 0);
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet * mult, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(result.value, "lose");
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_keno_single_pick() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "keno_single_player";
+        let user_info = mock_info(user, &coins(500_000, "uatom"));
+
+        // 只选 1 个号码
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayKeno {
+                picks: vec![42],
+            },
+        )
+        .unwrap();
+
+        let hit_count: u8 = res
+            .attributes.iter().find(|a| a.key == "hit_count").unwrap()
+            .value.parse().unwrap();
+        let result = res.attributes.iter().find(|a| a.key == "result").unwrap();
+
+        if hit_count == 1 {
+            assert_eq!(result.value, "win");
+            // 选1中1 赔率 3×
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(1_500_000, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(result.value, "lose");
+        }
+    }
+
+    #[test]
+    fn test_play_keno_max_picks() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(100_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "keno_max_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        // 选 10 个号码
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayKeno {
+                picks: vec![1, 10, 20, 30, 40, 50, 60, 70, 75, 80],
+            },
+        )
+        .unwrap();
+
+        let pick_count: u8 = res
+            .attributes.iter().find(|a| a.key == "pick_count").unwrap()
+            .value.parse().unwrap();
+        assert_eq!(pick_count, 10);
+
+        let result = res.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert!(result.value == "win" || result.value == "lose");
+    }
+
+    #[test]
+    fn test_keno_validation() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        // 空选号
+        let err1 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlayKeno { picks: vec![] },
+        );
+        assert!(err1.is_err(), "should reject empty picks");
+
+        // 超过 10 个号码
+        let err2 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlayKeno {
+                picks: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            },
+        );
+        assert!(err2.is_err(), "should reject more than 10 picks");
+
+        // 号码超出范围
+        let err3 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlayKeno { picks: vec![0, 42] },
+        );
+        assert!(err3.is_err(), "should reject number 0");
+
+        let err4 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlayKeno { picks: vec![81] },
+        );
+        assert!(err4.is_err(), "should reject number > 80");
+
+        // 重复号码
+        let err5 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+            ExecuteMsg::PlayKeno { picks: vec![5, 5, 10] },
+        );
+        assert!(err5.is_err(), "should reject duplicate numbers");
+
+        // 下注金额过小
+        let err6 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(50_000, "uatom")),
+            ExecuteMsg::PlayKeno { picks: vec![1] },
+        );
+        assert!(err6.is_err(), "should reject bet below 100,000");
+
+        // 下注金额过大
+        let err7 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(20_000_000, "uatom")),
+            ExecuteMsg::PlayKeno { picks: vec![1] },
+        );
+        assert!(err7.is_err(), "should reject bet above 10,000,000");
+    }
+
+    #[test]
+    fn test_keno_payout_table() {
+        use crate::keno::keno_payout_multiplier;
+
+        // 选1
+        assert_eq!(keno_payout_multiplier(1, 0), 0);
+        assert_eq!(keno_payout_multiplier(1, 1), 3);
+
+        // 选3
+        assert_eq!(keno_payout_multiplier(3, 0), 0);
+        assert_eq!(keno_payout_multiplier(3, 1), 0);
+        assert_eq!(keno_payout_multiplier(3, 2), 2);
+        assert_eq!(keno_payout_multiplier(3, 3), 16);
+
+        // 选5
+        assert_eq!(keno_payout_multiplier(5, 2), 0);
+        assert_eq!(keno_payout_multiplier(5, 3), 2);
+        assert_eq!(keno_payout_multiplier(5, 4), 12);
+        assert_eq!(keno_payout_multiplier(5, 5), 50);
+
+        // 选10
+        assert_eq!(keno_payout_multiplier(10, 4), 0);
+        assert_eq!(keno_payout_multiplier(10, 5), 2);
+        assert_eq!(keno_payout_multiplier(10, 10), 2000);
+    }
+
+    #[test]
+    fn test_keno_draw_no_duplicates() {
+        // 验证开出的 20 个号码无重复且在 1-80 范围内
+        let info = mock_info("test_user", &coins(1_000_000, "uatom"));
+        let env = mock_env();
+        let drawn = draw_keno_numbers(&info, &env);
+
+        assert_eq!(drawn.len(), 20, "should draw exactly 20 numbers");
+
+        for &n in &drawn {
+            assert!(n >= 1 && n <= 80, "number {} out of range", n);
+        }
+
+        // 检查无重复
+        let mut unique = drawn.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 20, "drawn numbers should be unique");
+
+        // 验证已排序
+        let mut sorted = drawn.clone();
+        sorted.sort_unstable();
+        assert_eq!(drawn, sorted, "drawn numbers should be sorted");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 刮刮乐（Scratch Card）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_play_scratch_card_classic() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "scratch_player";
+        let bet = 500_000u128;
+        let user_info = mock_info(user, &coins(bet, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Classic,
+            },
+        )
+        .unwrap();
+
+        // 检查基本属性
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "action").unwrap().value,
+            "play_scratch_card"
+        );
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "card_type").unwrap().value,
+            "Classic"
+        );
+
+        // 检查 3×3 = 9 个格子都有输出
+        for row in 1..=3usize {
+            for col in 1..=3usize {
+                let key = format!("cell_{}_{}", row, col);
+                assert!(
+                    res.attributes.iter().any(|a| a.key == key),
+                    "missing {}",
+                    key
+                );
+            }
+        }
+
+        // 检查行 emoji 展示
+        assert!(res.attributes.iter().any(|a| a.key == "row_1"));
+        assert!(res.attributes.iter().any(|a| a.key == "row_2"));
+        assert!(res.attributes.iter().any(|a| a.key == "row_3"));
+
+        // 检查中奖线数
+        assert!(res.attributes.iter().any(|a| a.key == "winning_lines"));
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            assert!(res.messages.len() == 1);
+            let mult: u128 = res.attributes.iter()
+                .find(|a| a.key == "total_multiplier").unwrap()
+                .value.parse().unwrap();
+            assert!(mult >= 2, "multiplier should be at least 2");
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet * mult, "uatom"),
+                }
+                .into()
+            );
+            // 检查 win_desc 存在
+            assert!(res.attributes.iter().any(|a| a.key == "win_desc"));
+        } else {
+            assert_eq!(result.value, "lose");
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_play_scratch_card_premium() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "scratch_premium_player";
+        let user_info = mock_info(user, &coins(1_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Premium,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "card_type").unwrap().value,
+            "Premium"
+        );
+        let result = res.attributes.iter().find(|a| a.key == "result").unwrap();
+        assert!(result.value == "win" || result.value == "lose");
+    }
+
+    #[test]
+    fn test_play_scratch_card_deluxe() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "scratch_deluxe_player";
+        let user_info = mock_info(user, &coins(2_000_000, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Deluxe,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "card_type").unwrap().value,
+            "Deluxe"
+        );
+    }
+
+    #[test]
+    fn test_scratch_card_bet_limits() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        // Classic 下注过小
+        let err1 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(50_000, "uatom")),
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Classic,
+            },
+        );
+        assert!(err1.is_err(), "Classic should reject bet below 100,000");
+
+        // Classic 下注过大
+        let err2 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(3_000_000, "uatom")),
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Classic,
+            },
+        );
+        assert!(err2.is_err(), "Classic should reject bet above 2,000,000");
+
+        // Premium 下注过小
+        let err3 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(200_000, "uatom")),
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Premium,
+            },
+        );
+        assert!(err3.is_err(), "Premium should reject bet below 500,000");
+
+        // Deluxe 下注过小
+        let err4 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(500_000, "uatom")),
+            ExecuteMsg::PlayScratchCard {
+                card_type: ScratchCardType::Deluxe,
+            },
+        );
+        assert!(err4.is_err(), "Deluxe should reject bet below 1,000,000");
+    }
+
+    #[test]
+    fn test_scratch_card_evaluation_logic() {
+        use crate::scratch::{evaluate_scratch_card, ScratchSymbol};
+
+        // 全部相同 → 8 条线全中
+        let all_diamond = [ScratchSymbol::Diamond; 9];
+        let (mult, lines) = evaluate_scratch_card(&all_diamond);
+        assert_eq!(lines.len(), 8, "all same should win 8 lines");
+        assert_eq!(mult, 50 * 8, "8 lines × 50× each");
+
+        // 第一行全 Cherry → 1 条线
+        let mut grid = [ScratchSymbol::Lemon; 9];
+        grid[0] = ScratchSymbol::Cherry;
+        grid[1] = ScratchSymbol::Cherry;
+        grid[2] = ScratchSymbol::Cherry;
+        let (mult2, lines2) = evaluate_scratch_card(&grid);
+        // row1 中奖 Cherry(3×)，row2 和 row3 全 Lemon(2×)，列和对角线不一定
+        // row2: [Lemon, Lemon, Lemon] → 中，row3: [Lemon, Lemon, Lemon] → 中
+        // col1: [Cherry, Lemon, Lemon] → 不中
+        // 需要精确计算
+        assert!(lines2.iter().any(|l| l.0 == "row1"), "row1 should win");
+        assert!(lines2.iter().any(|l| l.0 == "row2"), "row2 (all Lemon) should win");
+        assert!(lines2.iter().any(|l| l.0 == "row3"), "row3 (all Lemon) should win");
+        assert_eq!(mult2, 3 + 2 + 2, "Cherry 3× + Lemon 2× + Lemon 2× = 7×");
+
+        // 无任何三连 → 0
+        let no_match = [
+            ScratchSymbol::Diamond, ScratchSymbol::Star,    ScratchSymbol::Clover,
+            ScratchSymbol::Bell,    ScratchSymbol::Cherry,  ScratchSymbol::Lemon,
+            ScratchSymbol::Star,    ScratchSymbol::Diamond, ScratchSymbol::Bell,
+        ];
+        let (mult3, lines3) = evaluate_scratch_card(&no_match);
+        assert_eq!(mult3, 0);
+        assert_eq!(lines3.len(), 0);
+
+        // 对角线中奖
+        let mut diag_grid = [ScratchSymbol::Lemon; 9];
+        diag_grid[0] = ScratchSymbol::Star;
+        diag_grid[4] = ScratchSymbol::Star;
+        diag_grid[8] = ScratchSymbol::Star;
+        // grid: Star Lemon Lemon / Lemon Star Lemon / Lemon Lemon Star
+        // diag1: [0,4,8] = Star → 中
+        // row2: [Lemon, Star, Lemon] → 不中
+        // 但 row1 和 row3 没有全 Lemon（因为有 Star 在角上）
+        // row1: [Star, Lemon, Lemon] → 不中
+        let (mult4, lines4) = evaluate_scratch_card(&diag_grid);
+        assert!(lines4.iter().any(|l| l.0 == "diag1"), "diag1 should win");
+        // diag1 中 Star(20×) 只有这一条
+        assert!(mult4 >= 20, "at least Star 20× for diag1");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 斗牛（Bull Fight / Niu Niu）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_play_bullfight() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        let user = "bull_player";
+        let bet = 1_000_000u128;
+        let user_info = mock_info(user, &coins(bet, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayBullFight {},
+        )
+        .unwrap();
+
+        // 检查基本属性
+        assert_eq!(
+            res.attributes.iter().find(|a| a.key == "action").unwrap().value,
+            "play_bullfight"
+        );
+        assert!(res.attributes.iter().any(|a| a.key == "player_cards"));
+        assert!(res.attributes.iter().any(|a| a.key == "dealer_cards"));
+        assert!(res.attributes.iter().any(|a| a.key == "player_hand_type"));
+        assert!(res.attributes.iter().any(|a| a.key == "dealer_hand_type"));
+        assert!(res.attributes.iter().any(|a| a.key == "player_score"));
+        assert!(res.attributes.iter().any(|a| a.key == "dealer_score"));
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            assert_eq!(res.messages.len(), 1);
+            let mult: u128 = res.attributes.iter()
+                .find(|a| a.key == "payout_multiplier").unwrap()
+                .value.parse().unwrap();
+            assert!(mult >= 2 && mult <= 8, "multiplier should be 2-8, got {}", mult);
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet * mult, "uatom"),
+                }
+                .into()
+            );
+        } else if result.value == "tie" {
+            assert_eq!(res.messages.len(), 1);
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(bet, "uatom"),
+                }
+                .into()
+            );
+        } else {
+            assert_eq!(result.value, "lose");
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_bullfight_bet_limits() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {};
+        let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
+
+        // 下注过小
+        let err1 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(50_000, "uatom")),
+            ExecuteMsg::PlayBullFight {},
+        );
+        assert!(err1.is_err(), "should reject bet below 100,000");
+
+        // 下注过大
+        let err2 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(20_000_000, "uatom")),
+            ExecuteMsg::PlayBullFight {},
+        );
+        assert!(err2.is_err(), "should reject bet above 10,000,000");
+    }
+
+    #[test]
+    fn test_bullfight_hand_evaluation() {
+        use crate::bullfight::{evaluate_bull_hand, BullCard, BullHandType, Suit};
+
+        // ── 五小牛：A A A 2 3 → 全 ≤5，总和=1+1+1+2+3=8 ≤10 ──
+        let wu_xiao = [
+            BullCard { rank: 1, suit: Suit::Spades },
+            BullCard { rank: 1, suit: Suit::Hearts },
+            BullCard { rank: 1, suit: Suit::Diamonds },
+            BullCard { rank: 2, suit: Suit::Clubs },
+            BullCard { rank: 3, suit: Suit::Spades },
+        ];
+        let r1 = evaluate_bull_hand(&wu_xiao);
+        assert_eq!(r1.hand_type, BullHandType::WuXiaoNiu);
+        assert!(r1.score >= 90_000);
+
+        // ── 四炸：K K K K 5 ──
+        let si_zha = [
+            BullCard { rank: 13, suit: Suit::Spades },
+            BullCard { rank: 13, suit: Suit::Hearts },
+            BullCard { rank: 13, suit: Suit::Diamonds },
+            BullCard { rank: 13, suit: Suit::Clubs },
+            BullCard { rank: 5, suit: Suit::Spades },
+        ];
+        let r2 = evaluate_bull_hand(&si_zha);
+        assert!(matches!(r2.hand_type, BullHandType::SiZha { rank: 13 }));
+        assert!(r2.score >= 80_000);
+
+        // ── 五花牛：J Q K J Q ──
+        let wu_hua = [
+            BullCard { rank: 11, suit: Suit::Spades },
+            BullCard { rank: 12, suit: Suit::Hearts },
+            BullCard { rank: 13, suit: Suit::Diamonds },
+            BullCard { rank: 11, suit: Suit::Clubs },
+            BullCard { rank: 12, suit: Suit::Diamonds },
+        ];
+        let r3 = evaluate_bull_hand(&wu_hua);
+        assert_eq!(r3.hand_type, BullHandType::WuHuaNiu);
+        assert!(r3.score >= 70_000);
+
+        // ── 牛牛：10 10 10 J K → 三张 10+10+10=30(10倍), 剩余 10+10=20(10倍) ──
+        let niu_niu = [
+            BullCard { rank: 10, suit: Suit::Spades },
+            BullCard { rank: 10, suit: Suit::Hearts },
+            BullCard { rank: 10, suit: Suit::Diamonds },
+            BullCard { rank: 11, suit: Suit::Clubs },
+            BullCard { rank: 13, suit: Suit::Spades },
+        ];
+        let r4 = evaluate_bull_hand(&niu_niu);
+        assert_eq!(r4.hand_type, BullHandType::NiuNiu);
+        assert!(r4.score >= 60_000);
+
+        // ── 牛 7：10 J 10 3 4 → 10+10+10=30(牛), 3+4=7 ──
+        let niu7 = [
+            BullCard { rank: 10, suit: Suit::Spades },
+            BullCard { rank: 11, suit: Suit::Hearts },
+            BullCard { rank: 10, suit: Suit::Diamonds },
+            BullCard { rank: 3, suit: Suit::Clubs },
+            BullCard { rank: 4, suit: Suit::Spades },
+        ];
+        let r5 = evaluate_bull_hand(&niu7);
+        assert_eq!(r5.hand_type, BullHandType::NiuN { n: 7 });
+        assert!(r5.score >= 50_000);
+
+        // ── 没牛：A 2 6 8 K → 无法选 3 张凑成 10 的倍数 ──
+        // 检查：1+2+6=9, 1+2+10=13, 1+6+8=15, 1+6+10=17, 1+8+10=19
+        //       2+6+8=16, 2+6+10=18, 2+8+10=20✓ → 有牛，剩余 1+6=7 → 牛7
+        // 用 A 3 6 8 K: 1+3+6=10✓ → 牛8+10=18%10=8 → 牛8
+        // 用另一组: A 2 3 6 8: 1+2+3=6, 1+2+6=9, 1+2+8=11, 1+3+6=10✓ → 牛 2+8=10%10=0 → 牛牛
+        // 真正没牛的例子：A 2 3 7 K: 1+2+3=6, 1+2+7=10✓ → 有牛，3+10=13%10=3 → 牛3
+        // 更好的没牛：A 2 4 7 K: 1+2+4=7, 1+2+7=10✓ → 牛 4+10=14%10=4
+        // 直接构造：3 4 6 7 8 → 3+4+6=13, 3+4+7=14, 3+4+8=15, 3+6+7=16, 3+6+8=17,
+        //                       3+7+8=18, 4+6+7=17, 4+6+8=18, 4+7+8=19, 6+7+8=21
+        // 没有 10 的倍数 → 没牛！
+        let no_niu = [
+            BullCard { rank: 3, suit: Suit::Spades },
+            BullCard { rank: 4, suit: Suit::Hearts },
+            BullCard { rank: 6, suit: Suit::Diamonds },
+            BullCard { rank: 7, suit: Suit::Clubs },
+            BullCard { rank: 8, suit: Suit::Spades },
+        ];
+        let r6 = evaluate_bull_hand(&no_niu);
+        assert_eq!(r6.hand_type, BullHandType::NoNiu);
+        assert!(r6.score < 50_000);
+
+        // ── 牌型强弱排序 ──
+        assert!(r1.score > r2.score, "五小牛 > 四炸");
+        assert!(r2.score > r3.score, "四炸 > 五花牛");
+        assert!(r3.score > r4.score, "五花牛 > 牛牛");
+        assert!(r4.score > r5.score, "牛牛 > 牛7");
+        assert!(r5.score > r6.score, "牛7 > 没牛");
+    }
+
+    #[test]
+    fn test_bullfight_payout_multipliers() {
+        use crate::bullfight::{bull_payout_multiplier, BullHandType};
+
+        assert_eq!(bull_payout_multiplier(&BullHandType::WuXiaoNiu), 8);
+        assert_eq!(bull_payout_multiplier(&BullHandType::SiZha { rank: 10 }), 7);
+        assert_eq!(bull_payout_multiplier(&BullHandType::WuHuaNiu), 6);
+        assert_eq!(bull_payout_multiplier(&BullHandType::NiuNiu), 4);
+        assert_eq!(bull_payout_multiplier(&BullHandType::NiuN { n: 9 }), 3);
+        assert_eq!(bull_payout_multiplier(&BullHandType::NiuN { n: 8 }), 3);
+        assert_eq!(bull_payout_multiplier(&BullHandType::NiuN { n: 7 }), 2);
+        assert_eq!(bull_payout_multiplier(&BullHandType::NiuN { n: 1 }), 2);
+        assert_eq!(bull_payout_multiplier(&BullHandType::NoNiu), 2);
     }
 }

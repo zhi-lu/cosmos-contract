@@ -3,6 +3,7 @@ use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use crate::omaha::OmahaState;
+use crate::texas::TexasState;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct State {
@@ -34,4 +35,7 @@ pub const BLACKJACK_STATE: Map<&Addr, BlackjackState> = Map::new("blackjack_stat
 
 // 奥马哈扑克状态
 pub const OMAHA_STATE: Map<&Addr, OmahaState> = Map::new("omaha_state");
+
+// 德州扑克状态
+pub const TEXAS_STATE: Map<&Addr, TexasState> = Map::new("texas_state");
 
