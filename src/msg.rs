@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::dice::DiceGameMode;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct InstantiateMsg {}
+pub struct InstantiateMsg {
+    /// 庄家抽水比例（基点），100 = 1%，最高 1000 = 10%，默认 0
+    pub house_edge_bps: Option<u16>,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +52,8 @@ pub enum ExecuteMsg {
     PlayBullFight {},
     // 部署者提款
     Withdraw { amount: u128 },
+    // 部署者修改抽水比例（基点），100 = 1%，最高 1000 = 10%
+    UpdateHouseEdge { new_house_edge_bps: u16 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -65,4 +70,7 @@ pub enum QueryMsg {
 
     // 查询某用户当前 Texas Hold'em 游戏状态
     GetTexasState { address: String },
+
+    // 查询当前庄家抽水比例
+    GetHouseEdge {},
 }

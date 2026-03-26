@@ -7,8 +7,9 @@ use crate::texas::TexasState;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct State {
-    pub owner: Addr,         // 合约所有者（部署者）
-    pub locked_amount: u128, // 锁仓金额
+    pub owner: Addr,           // 合约所有者（部署者）
+    pub locked_amount: u128,   // 锁仓金额
+    pub house_edge_bps: u16,   // 庄家抽水（基点，100 = 1%，最高 1000 = 10%）
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -25,6 +26,11 @@ pub type BlackjackStateResponse = BlackjackState;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LockedAmountResponse {
     pub locked_amount: Uint128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HouseEdgeResponse {
+    pub house_edge_bps: u16,
 }
 
 // 锁仓状态

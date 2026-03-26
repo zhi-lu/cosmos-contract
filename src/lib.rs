@@ -39,8 +39,8 @@ use crate::scratch::{
 use crate::sicbo::{calculate_sicbo_payout, validate_bet, SicBoBetType, SicBoResult};
 use crate::slot::{evaluate_advanced, evaluate_basic, evaluate_mega, Symbol, SlotMode};
 use crate::state::{
-    BlackjackState, BlackjackStateResponse, LockedAmountResponse, State, BLACKJACK_STATE,
-    OMAHA_STATE, STATE, TEXAS_STATE,
+    BlackjackState, BlackjackStateResponse, HouseEdgeResponse, LockedAmountResponse, State,
+    BLACKJACK_STATE, OMAHA_STATE, STATE, TEXAS_STATE,
 };
 use crate::texas::{
     best_texas_hand_rank, TexasAction, TexasState, TexasStateResponse, TexasStage,
@@ -55,7 +55,7 @@ pub fn instantiate(
     deps: DepsMut,
     _env: Env,
     info: MessageInfo,
-    _msg: InstantiateMsg,
+    msg: InstantiateMsg,
 ) -> StdResult<Response> {
     // 初始化需要的最少锁仓金额
     let required_minimum_lock_coin_amount = 10_000_000_000;
@@ -74,10 +74,19 @@ pub fn instantiate(
         )));
     }
 
+    // 验证抽水比例：最高 1000 基点 = 10%
+    let house_edge_bps = msg.house_edge_bps.unwrap_or(0);
+    if house_edge_bps > 1000 {
+        return Err(StdError::generic_err(
+            "House edge must not exceed 1000 bps (10%)",
+        ));
+    }
+
     // 存储初始状态
     let state = State {
         owner: info.sender.clone(),
         locked_amount: received.u128(),
+        house_edge_bps,
     };
 
     STATE.save(deps.storage, &state)?;
@@ -85,7 +94,8 @@ pub fn instantiate(
     Ok(Response::new()
         .add_attribute("action", "init")
         .add_attribute("owner", info.sender)
-        .add_attribute("locked_amount", received.to_string()))
+        .add_attribute("locked_amount", received.to_string())
+        .add_attribute("house_edge_bps", house_edge_bps.to_string()))
 }
 
 /// 处理执行逻辑
@@ -131,6 +141,9 @@ pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> S
         ExecuteMsg::PlayScratchCard { card_type } => play_scratch_card(deps, env, info, card_type),
         ExecuteMsg::PlayBullFight {} => play_bullfight(deps, env, info),
         ExecuteMsg::Withdraw { amount } => withdraw_funds(deps, info, amount),
+        ExecuteMsg::UpdateHouseEdge { new_house_edge_bps } => {
+            update_house_edge(deps, info, new_house_edge_bps)
+        }
     }
 }
 
@@ -200,6 +213,13 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             };
             to_json_binary(&resp)
         }
+        QueryMsg::GetHouseEdge {} => {
+            let state = STATE.load(deps.storage)?;
+            let resp = HouseEdgeResponse {
+                house_edge_bps: state.house_edge_bps,
+            };
+            to_json_binary(&resp)
+        }
     }
 }
 
@@ -234,16 +254,18 @@ fn play_war(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult<Response> {
     let mut response = Response::new();
     let mut result = "lost";
     if user_rand > contract_rand {
-        // 用户赢: 发送奖励（下注金额 ×2）
+        // 用户赢: 发送奖励（下注金额 ×2，扣除抽水）
+        let gross_payout = sent_amount * 2;
+        let net_payout = apply_house_edge(gross_payout, sent_amount, state.house_edge_bps);
         let payout = Coin {
             denom: "uatom".to_string(),
-            amount: Uint128::from(sent_amount * 2),
+            amount: Uint128::from(net_payout),
         };
         response = response.add_message(BankMsg::Send {
             to_address: info.sender.to_string(),
             amount: vec![payout],
         });
-        state.locked_amount -= sent_amount * 2;
+        state.locked_amount -= net_payout;
         result = "win"
     } else if user_rand == contract_rand {
         // 平局: 退还下注
@@ -434,7 +456,8 @@ fn play_slot(deps: DepsMut, env: Env, info: MessageInfo, mode: SlotMode) -> StdR
 
     // ── 结算 ──────────────────────────────────────
     if payout_multiplier > 0 {
-        let payout_amount = sent_amount * payout_multiplier as u128;
+        let gross_payout = sent_amount * payout_multiplier as u128;
+        let payout_amount = apply_house_edge(gross_payout, sent_amount, state.house_edge_bps);
 
         // 防止合约余额不足时超额赔付
         if payout_amount > state.locked_amount {
@@ -498,10 +521,10 @@ fn play_guess_number(
     let mut result = "lost";
 
     if user_guess as u32 == rand {
-        payout = sent_amount * 10;
+        payout = apply_house_edge(sent_amount * 10, sent_amount, state.house_edge_bps);
         result = "exact";
     } else if (user_guess as i32 - rand as i32).abs() == 1 {
-        payout = sent_amount * 1;
+        payout = apply_house_edge(sent_amount * 1, sent_amount, state.house_edge_bps);
         result = "adjacent";
     }
 
@@ -564,6 +587,55 @@ fn withdraw_funds(deps: DepsMut, info: MessageInfo, amount: u128) -> StdResult<R
         })
         .add_attribute("action", "withdraw")
         .add_attribute("amount", amount.to_string()))
+}
+
+/// 修改庄家抽水比例（仅限所有者）
+///
+/// 抽水比例以基点表示，100 基点 = 1%，最高 1000 基点 = 10%
+fn update_house_edge(
+    deps: DepsMut,
+    info: MessageInfo,
+    new_house_edge_bps: u16,
+) -> StdResult<Response> {
+    let mut state = STATE.load(deps.storage)?;
+
+    // 检查调用者是否为所有者
+    if info.sender != state.owner {
+        return Err(StdError::generic_err("Unauthorized"));
+    }
+
+    // 验证抽水比例不超过 10%
+    if new_house_edge_bps > 1000 {
+        return Err(StdError::generic_err(
+            "House edge must not exceed 1000 bps (10%)",
+        ));
+    }
+
+    let old_bps = state.house_edge_bps;
+    state.house_edge_bps = new_house_edge_bps;
+    STATE.save(deps.storage, &state)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "update_house_edge")
+        .add_attribute("old_house_edge_bps", old_bps.to_string())
+        .add_attribute("new_house_edge_bps", new_house_edge_bps.to_string()))
+}
+
+/// 对净赢利部分扣除庄家抽水
+///
+/// `gross_payout`  = 玩家总共应收到的金额（包含本金 + 赢利）
+/// `original_bet`  = 玩家原始下注额
+/// `house_edge_bps` = 抽水基点（0-1000）
+///
+/// 抽水仅作用于净赢利部分（gross_payout - original_bet），不影响退还本金。
+/// 返回扣除抽水后的实际支付金额。
+fn apply_house_edge(gross_payout: u128, original_bet: u128, house_edge_bps: u16) -> u128 {
+    if house_edge_bps == 0 || gross_payout <= original_bet {
+        return gross_payout; // 无抽水或无赢利（平局 / 亏损）
+    }
+    let net_winnings = gross_payout - original_bet;
+    let rake = net_winnings * house_edge_bps as u128 / 10_000;
+    gross_payout - rake
 }
 
 /// 21 点游戏启动
@@ -686,10 +758,15 @@ fn play_blackjack_stand(deps: DepsMut, env: Env, info: MessageInfo) -> StdResult
     let result: &str;
     let payout: Uint128;
 
+    // 加载抽水比例
+    let global_state_for_edge = STATE.load(deps.storage)?;
+    let house_edge = global_state_for_edge.house_edge_bps;
+
     if dealer_total > 21 {
         // 玩家赢了
         result = "player_win";
-        payout = state.bet * Uint128::new(2);
+        let gross = (state.bet * Uint128::new(2)).u128();
+        payout = Uint128::from(apply_house_edge(gross, state.bet.u128(), house_edge));
     } else if user_total < dealer_total {
         // 玩家输了
         result = "dealer_win";
@@ -776,8 +853,10 @@ fn play_coin_flip(
         .add_attribute("actual_result", format!("{:?}", result));
 
     if choice == result {
-        // 赢了,奖励翻倍
-        let payout = Uint128::from(bet) * Uint128::new(2);
+        // 赢了,奖励翻倍（扣除抽水）
+        let gross = bet * 2;
+        let net = apply_house_edge(gross, bet, state.house_edge_bps);
+        let payout = Uint128::from(net);
         state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
         STATE.save(deps.storage, &state)?;
 
@@ -842,8 +921,10 @@ fn play_dice_guess_size(
         .add_attribute("actual_result", format!("{:?}", result));
 
     if guess_big == result {
-        // 赢了发送奖励
-        let payout = Uint128::from(bet) * Uint128::new(2);
+        // 赢了发送奖励（扣除抽水）
+        let gross = bet * 2;
+        let net = apply_house_edge(gross, bet, state.house_edge_bps);
+        let payout = Uint128::from(net);
         state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
         STATE.save(deps.storage, &state)?;
 
@@ -904,7 +985,9 @@ fn play_dice_exact_number(
 
     // 如果猜对,玩家则获得 bet * 6 的金额,否则损失 bet 的金额。
     if number as u32 == rand_number {
-        let payout = Uint128::from(bet) * Uint128::new(6);
+        let gross = bet * 6;
+        let net = apply_house_edge(gross, bet, state.house_edge_bps);
+        let payout = Uint128::from(net);
         state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
         STATE.save(deps.storage, &state)?;
 
@@ -968,7 +1051,9 @@ fn play_dice_range_bet(
     let rand_number = utils::generate_random_number(&info, &env, b"dice_range_bet") % 6 + 1;
 
     if rand_number >= start as u32 && rand_number <= end as u32 {
-        let payout = Uint128::from(bet) * Uint128::new(times);
+        let gross = bet * times as u128;
+        let net = apply_house_edge(gross, bet, state.house_edge_bps);
+        let payout = Uint128::from(net);
         state.locked_amount = state.locked_amount.saturating_sub(payout.u128());
         STATE.save(deps.storage, &state)?;
 
@@ -1110,7 +1195,8 @@ fn play_baccarat(
             winnings = bet * 8; // 8倍奖金
         }
 
-        let payout_amount = bet + winnings; // 本金+奖金
+        let gross_payout = bet + winnings; // 本金+奖金
+        let payout_amount = apply_house_edge(gross_payout, bet, state.house_edge_bps);
         let payout = Coin {
             denom: "uatom".to_string(),
             amount: Uint128::from(payout_amount),
@@ -1203,7 +1289,8 @@ fn play_roulette(
         .add_attribute("bet_type", format!("{:?}", bet_type));
 
     if won {
-        let winnings = bet * payout_multiplier;
+        let gross = bet * payout_multiplier;
+        let winnings = apply_house_edge(gross, bet, state.house_edge_bps);
         let payout = Coin {
             denom: "uatom".to_string(),
             amount: Uint128::from(winnings),
@@ -1527,8 +1614,9 @@ fn play_omaha(
                 .add_attribute("dealer_rank", dealer_rank.to_string());
 
             if player_rank > dealer_rank {
-                // 玩家赢：获得 2× 下注额
-                let payout = total_bet * 2;
+                // 玩家赢：获得 2× 下注额（扣除抽水）
+                let gross = total_bet * 2;
+                let payout = apply_house_edge(gross, total_bet, global_state.house_edge_bps);
                 global_state.locked_amount =
                     global_state.locked_amount.saturating_sub(payout);
                 response = response
@@ -1994,8 +2082,9 @@ fn settle_texas(
         .add_attribute("dealer_rank", dealer_rank.to_string());
 
     if player_rank > dealer_rank {
-        // 玩家赢：获得 2× 下注额
-        let payout = total_bet * 2;
+        // 玩家赢：获得 2× 下注额（扣除抽水）
+        let gross = total_bet * 2;
+        let payout = apply_house_edge(gross, total_bet, global_state.house_edge_bps);
         global_state.locked_amount = global_state.locked_amount.saturating_sub(payout);
         response = response
             .add_attribute("result", "player_win")
@@ -2175,9 +2264,10 @@ fn play_sangong(
         .add_attribute("dealer_score", dealer_rank.score.to_string());
 
     if player_rank.score > dealer_rank.score {
-        // 玩家赢
+        // 玩家赢（扣除抽水）
         let multiplier = sangong_payout_multiplier(&player_rank.hand_type);
-        let payout = bet * multiplier;
+        let gross = bet * multiplier;
+        let payout = apply_house_edge(gross, bet, state.house_edge_bps);
 
         state.locked_amount = state.locked_amount.saturating_sub(payout);
         response = response
@@ -2312,7 +2402,8 @@ fn play_sicbo(
         .add_attribute("bet_type", format!("{:?}", bet_type));
 
     if won {
-        let payout = bet * multiplier;
+        let gross = bet * multiplier;
+        let payout = apply_house_edge(gross, bet, state.house_edge_bps);
 
         state.locked_amount = state.locked_amount.saturating_sub(payout);
         response = response
@@ -2395,7 +2486,8 @@ fn play_keno(
         .add_attribute("hit_count", hit_count.to_string());
 
     if multiplier > 0 {
-        let payout = bet * multiplier;
+        let gross = bet * multiplier;
+        let payout = apply_house_edge(gross, bet, state.house_edge_bps);
 
         state.locked_amount = state.locked_amount.saturating_sub(payout);
         response = response
@@ -2513,8 +2605,9 @@ fn play_scratch_card(
     response = response.add_attribute("winning_lines", win_count.to_string());
 
     if total_multiplier > 0 {
-        // 有中奖
-        let payout = bet * total_multiplier;
+        // 有中奖（扣除抽水）
+        let gross = bet * total_multiplier;
+        let payout = apply_house_edge(gross, bet, state.house_edge_bps);
 
         // 输出每条中奖线
         let win_desc: Vec<String> = winning_lines
@@ -2608,9 +2701,10 @@ fn play_bullfight(
         .add_attribute("dealer_score", dealer_rank.score.to_string());
 
     if player_rank.score > dealer_rank.score {
-        // 玩家赢
+        // 玩家赢（扣除抽水）
         let multiplier = bull_payout_multiplier(&player_rank.hand_type);
-        let payout = bet * multiplier;
+        let gross = bet * multiplier;
+        let payout = apply_house_edge(gross, bet, state.house_edge_bps);
 
         state.locked_amount = state.locked_amount.saturating_sub(payout);
         response = response
@@ -2699,7 +2793,7 @@ mod tests {
     #[test]
     pub fn test_init() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
         assert_eq!(0, res.messages.len());
@@ -2711,7 +2805,7 @@ mod tests {
     #[test]
     pub fn test_query() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
         let res = query(deps.as_ref(), mock_env(), QueryMsg::GetLockedAmount {}).unwrap();
@@ -2727,7 +2821,7 @@ mod tests {
     #[test]
     pub fn test_play_war() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
         let res = play_war(
@@ -2771,7 +2865,7 @@ mod tests {
         let mut deps = mock_dependencies();
 
         // 初始化合约
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
@@ -2816,7 +2910,7 @@ mod tests {
     pub fn test_play_slot_advanced() {
         let mut deps = mock_dependencies();
 
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
@@ -2864,7 +2958,7 @@ mod tests {
     pub fn test_play_slot_win_payout() {
         // 测试赢时支付金额正确（通过 execute 入口）
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
@@ -2910,7 +3004,7 @@ mod tests {
     #[test]
     pub fn test_play_guess_number() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
@@ -2973,7 +3067,7 @@ mod tests {
     #[test]
     pub fn test_withdraw_funds() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         let info_clone = info.clone();
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
@@ -2993,7 +3087,7 @@ mod tests {
         let mut deps = mock_dependencies();
 
         // 初始化合约
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, instantiate_msg).unwrap();
 
@@ -3074,7 +3168,7 @@ mod tests {
         let mut deps = mock_dependencies();
 
         // 初始化合约
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
 
@@ -3109,7 +3203,7 @@ mod tests {
         let mut deps = mock_dependencies();
 
         // 初始化合约
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
 
@@ -3146,7 +3240,7 @@ mod tests {
     #[test]
     fn test_play_dice_guess_size() {
         let mut deps = mock_dependencies();
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
         let user = "player1";
@@ -3194,7 +3288,7 @@ mod tests {
     #[test]
     fn test_play_dice_guess_number() {
         let mut deps = mock_dependencies();
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
         let user = "player1";
@@ -3241,7 +3335,7 @@ mod tests {
     #[test]
     fn test_play_dice_range_bet() {
         let mut deps = mock_dependencies();
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(20_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
         let user = "player1";
@@ -3302,7 +3396,7 @@ mod tests {
     #[test]
     fn test_play_baccarat() {
         let mut deps = mock_dependencies();
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
         let user = "player1";
@@ -3361,7 +3455,7 @@ mod tests {
     #[test]
     fn test_play_roulette() {
         let mut deps = mock_dependencies();
-        let instantiate_msg = InstantiateMsg {};
+        let instantiate_msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, instantiate_msg).unwrap();
         let user = "player1";
@@ -3432,7 +3526,7 @@ mod tests {
     #[test]
     fn test_play_slot_mega() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
@@ -3470,7 +3564,7 @@ mod tests {
     #[test]
     fn test_play_slot_mega_payout() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
 
@@ -3516,7 +3610,7 @@ mod tests {
     #[test]
     fn test_omaha_full_flow() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3598,7 +3692,7 @@ mod tests {
     #[test]
     fn test_omaha_fold() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3633,7 +3727,7 @@ mod tests {
     #[test]
     fn test_omaha_no_duplicate_game() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3657,7 +3751,7 @@ mod tests {
     #[test]
     fn test_omaha_raise_then_showdown() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3717,7 +3811,7 @@ mod tests {
     #[test]
     fn test_texas_full_flow() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3800,7 +3894,7 @@ mod tests {
     #[test]
     fn test_texas_fold() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3835,7 +3929,7 @@ mod tests {
     #[test]
     fn test_texas_no_duplicate_game() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3859,7 +3953,7 @@ mod tests {
     #[test]
     fn test_texas_check_advance() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3916,7 +4010,7 @@ mod tests {
     #[test]
     fn test_texas_all_in() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -3962,7 +4056,7 @@ mod tests {
     #[test]
     fn test_texas_raise_then_showdown() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4021,7 +4115,7 @@ mod tests {
     #[test]
     fn test_play_sangong() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4117,7 +4211,7 @@ mod tests {
     #[test]
     fn test_sangong_bet_limits() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4186,7 +4280,7 @@ mod tests {
     #[test]
     fn test_play_sicbo_big() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4237,7 +4331,7 @@ mod tests {
     #[test]
     fn test_play_sicbo_small() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4276,7 +4370,7 @@ mod tests {
     #[test]
     fn test_play_sicbo_total() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4315,7 +4409,7 @@ mod tests {
     #[test]
     fn test_play_sicbo_any_triple() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4353,7 +4447,7 @@ mod tests {
     #[test]
     fn test_play_sicbo_single_die() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4395,7 +4489,7 @@ mod tests {
     #[test]
     fn test_play_sicbo_combo() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4431,7 +4525,7 @@ mod tests {
     #[test]
     fn test_sicbo_bet_validation() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4593,7 +4687,7 @@ mod tests {
     #[test]
     fn test_play_keno_basic() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4658,7 +4752,7 @@ mod tests {
     #[test]
     fn test_play_keno_single_pick() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4700,7 +4794,7 @@ mod tests {
     #[test]
     fn test_play_keno_max_picks() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(100_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4730,7 +4824,7 @@ mod tests {
     #[test]
     fn test_keno_validation() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4857,7 +4951,7 @@ mod tests {
     #[test]
     fn test_play_scratch_card_classic() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4932,7 +5026,7 @@ mod tests {
     #[test]
     fn test_play_scratch_card_premium() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4960,7 +5054,7 @@ mod tests {
     #[test]
     fn test_play_scratch_card_deluxe() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -4986,7 +5080,7 @@ mod tests {
     #[test]
     fn test_scratch_card_bet_limits() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -5093,7 +5187,7 @@ mod tests {
     #[test]
     fn test_play_bullfight() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -5156,7 +5250,7 @@ mod tests {
     #[test]
     fn test_bullfight_bet_limits() {
         let mut deps = mock_dependencies();
-        let msg = InstantiateMsg {};
+        let msg = InstantiateMsg { house_edge_bps: None };
         let creator_info = mock_info("creator", &coins(10_000_000_000, "uatom"));
         instantiate(deps.as_mut(), mock_env(), creator_info, msg).unwrap();
 
@@ -5285,5 +5379,321 @@ mod tests {
         assert_eq!(bull_payout_multiplier(&BullHandType::NiuN { n: 7 }), 2);
         assert_eq!(bull_payout_multiplier(&BullHandType::NiuN { n: 1 }), 2);
         assert_eq!(bull_payout_multiplier(&BullHandType::NoNiu), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 庄家抽水（House Edge）测试
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_house_edge_function() {
+        // 无抽水
+        assert_eq!(apply_house_edge(2_000_000, 1_000_000, 0), 2_000_000);
+
+        // 5% 抽水（500 bps）：净赢利 1_000_000，抽水 50_000
+        assert_eq!(apply_house_edge(2_000_000, 1_000_000, 500), 1_950_000);
+
+        // 10% 抽水（1000 bps）：净赢利 1_000_000，抽水 100_000
+        assert_eq!(apply_house_edge(2_000_000, 1_000_000, 1000), 1_900_000);
+
+        // 1% 抽水（100 bps）：净赢利 1_000_000，抽水 10_000
+        assert_eq!(apply_house_edge(2_000_000, 1_000_000, 100), 1_990_000);
+
+        // 平局退还本金时不抽水
+        assert_eq!(apply_house_edge(1_000_000, 1_000_000, 500), 1_000_000);
+
+        // 高倍率赢利：10x 赢利，5% 抽水
+        // gross=10_000_000, bet=1_000_000, net_winnings=9_000_000, rake=450_000
+        assert_eq!(apply_house_edge(10_000_000, 1_000_000, 500), 9_550_000);
+
+        // 0 payout 不受影响
+        assert_eq!(apply_house_edge(0, 0, 500), 0);
+    }
+
+    #[test]
+    fn test_init_with_house_edge() {
+        let mut deps = mock_dependencies();
+
+        // 使用 5% 抽水初始化
+        let msg = InstantiateMsg { house_edge_bps: Some(500) };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        assert_eq!(res.attributes[0].value, "init");
+        assert_eq!(res.attributes[3].value, "500"); // house_edge_bps
+
+        // 查询抽水比例
+        let bin = query(deps.as_ref(), mock_env(), QueryMsg::GetHouseEdge {}).unwrap();
+        let resp: HouseEdgeResponse = from_json(&bin).unwrap();
+        assert_eq!(resp.house_edge_bps, 500);
+    }
+
+    #[test]
+    fn test_init_with_default_house_edge() {
+        let mut deps = mock_dependencies();
+
+        // 不设置抽水（默认 0）
+        let msg = InstantiateMsg { house_edge_bps: None };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let bin = query(deps.as_ref(), mock_env(), QueryMsg::GetHouseEdge {}).unwrap();
+        let resp: HouseEdgeResponse = from_json(&bin).unwrap();
+        assert_eq!(resp.house_edge_bps, 0);
+    }
+
+    #[test]
+    fn test_init_house_edge_exceeds_max() {
+        let mut deps = mock_dependencies();
+
+        // 超过 10% 应失败
+        let msg = InstantiateMsg { house_edge_bps: Some(1001) };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        let err = instantiate(deps.as_mut(), mock_env(), info, msg);
+        assert!(err.is_err(), "house edge > 1000 bps should be rejected");
+    }
+
+    #[test]
+    fn test_update_house_edge() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约，抽水 0
+        let msg = InstantiateMsg { house_edge_bps: None };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        // owner 修改抽水到 3%（300 bps）
+        let update_res = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("creator", &coins(0, "uatom")),
+            ExecuteMsg::UpdateHouseEdge { new_house_edge_bps: 300 },
+        ).unwrap();
+
+        assert_eq!(
+            update_res.attributes.iter().find(|a| a.key == "action").unwrap().value,
+            "update_house_edge"
+        );
+        assert_eq!(
+            update_res.attributes.iter().find(|a| a.key == "old_house_edge_bps").unwrap().value,
+            "0"
+        );
+        assert_eq!(
+            update_res.attributes.iter().find(|a| a.key == "new_house_edge_bps").unwrap().value,
+            "300"
+        );
+
+        // 验证查询结果
+        let bin = query(deps.as_ref(), mock_env(), QueryMsg::GetHouseEdge {}).unwrap();
+        let resp: HouseEdgeResponse = from_json(&bin).unwrap();
+        assert_eq!(resp.house_edge_bps, 300);
+    }
+
+    #[test]
+    fn test_update_house_edge_unauthorized() {
+        let mut deps = mock_dependencies();
+
+        let msg = InstantiateMsg { house_edge_bps: None };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        // 非 owner 尝试修改抽水
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("hacker", &coins(0, "uatom")),
+            ExecuteMsg::UpdateHouseEdge { new_house_edge_bps: 500 },
+        );
+        assert!(err.is_err(), "non-owner should not be able to update house edge");
+    }
+
+    #[test]
+    fn test_update_house_edge_exceeds_max() {
+        let mut deps = mock_dependencies();
+
+        let msg = InstantiateMsg { house_edge_bps: None };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        // 尝试设置超过 10% 的抽水
+        let err = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("creator", &coins(0, "uatom")),
+            ExecuteMsg::UpdateHouseEdge { new_house_edge_bps: 1001 },
+        );
+        assert!(err.is_err(), "house edge > 1000 bps should be rejected");
+
+        // 设置最大值 1000 应成功
+        let ok = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("creator", &coins(0, "uatom")),
+            ExecuteMsg::UpdateHouseEdge { new_house_edge_bps: 1000 },
+        );
+        assert!(ok.is_ok(), "house edge 1000 bps (10%) should be accepted");
+
+        // 设置 0 应成功
+        let ok2 = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("creator", &coins(0, "uatom")),
+            ExecuteMsg::UpdateHouseEdge { new_house_edge_bps: 0 },
+        );
+        assert!(ok2.is_ok(), "house edge 0 bps should be accepted");
+    }
+
+    #[test]
+    fn test_coin_flip_with_house_edge() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约，5% 抽水
+        let msg = InstantiateMsg { house_edge_bps: Some(500) };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let user = "player1";
+        let bet = 1_000_000u128;
+        let user_info = mock_info(user, &coins(bet, "uatom"));
+
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            user_info,
+            ExecuteMsg::PlayCoinFlip { choice: CoinSide::Heads },
+        ).unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            // 5% 抽水：gross=2_000_000, net_winnings=1_000_000, rake=50_000
+            // 实际支付 = 2_000_000 - 50_000 = 1_950_000
+            let payout_attr = res.attributes.iter().find(|a| a.key == "payout").unwrap();
+            let payout_val: u128 = payout_attr.value.parse().unwrap();
+            assert_eq!(payout_val, 1_950_000, "payout should reflect 5% house edge");
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: user.to_string(),
+                    amount: coins(1_950_000, "uatom"),
+                }.into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_war_with_house_edge() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约，10% 抽水
+        let msg = InstantiateMsg { house_edge_bps: Some(1000) };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let res = play_war(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("user", &coins(1_000_000, "uatom")),
+        ).unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").expect("result missing");
+
+        if result.value == "win" {
+            // 10% 抽水：gross=2_000_000, net_winnings=1_000_000, rake=100_000
+            // 实际支付 = 2_000_000 - 100_000 = 1_900_000
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: "user".to_string(),
+                    amount: coins(1_900_000, "uatom"),
+                }.into()
+            );
+        } else if result.value == "tie" {
+            // 平局不抽水
+            assert_eq!(
+                res.messages[0].msg,
+                BankMsg::Send {
+                    to_address: "user".to_string(),
+                    amount: coins(1_000_000, "uatom"),
+                }.into()
+            );
+        } else {
+            assert_eq!(res.messages.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_house_edge_locked_amount_accounting() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约，5% 抽水
+        let msg = InstantiateMsg { house_edge_bps: Some(500) };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        let initial_locked = 10_000_000_000u128;
+
+        // 玩硬币翻转游戏
+        let bet = 1_000_000u128;
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("player", &coins(bet, "uatom")),
+            ExecuteMsg::PlayCoinFlip { choice: CoinSide::Heads },
+        ).unwrap();
+
+        let result = res.attributes.iter().find(|a| a.key == "result").unwrap();
+
+        // 查询锁仓金额
+        let bin = query(deps.as_ref(), mock_env(), QueryMsg::GetLockedAmount {}).unwrap();
+        let resp: LockedAmountResponse = from_json(&bin).unwrap();
+
+        if result.value == "win" {
+            // 赢了：locked = initial + bet - payout
+            // payout = 1_950_000（扣除 5% 抽水后）
+            // locked = 10_000_000_000 + 1_000_000 - 1_950_000 = 10_000_050_000
+            // 庄家额外多留了 50_000 的抽水
+            assert_eq!(
+                resp.locked_amount.u128(),
+                initial_locked + bet - 1_950_000,
+                "locked amount should reflect house edge"
+            );
+        } else {
+            // 输了：locked = initial + bet
+            assert_eq!(
+                resp.locked_amount.u128(),
+                initial_locked + bet,
+                "locked amount should include lost bet"
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_house_edge() {
+        let mut deps = mock_dependencies();
+
+        // 初始化合约
+        let msg = InstantiateMsg { house_edge_bps: Some(250) };
+        let info = mock_info("creator", &coins(10_000_000_000, "uatom"));
+        instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        // 查询
+        let bin = query(deps.as_ref(), mock_env(), QueryMsg::GetHouseEdge {}).unwrap();
+        let resp: HouseEdgeResponse = from_json(&bin).unwrap();
+        assert_eq!(resp.house_edge_bps, 250);
+
+        // 更新后再查询
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            mock_info("creator", &coins(0, "uatom")),
+            ExecuteMsg::UpdateHouseEdge { new_house_edge_bps: 800 },
+        ).unwrap();
+
+        let bin2 = query(deps.as_ref(), mock_env(), QueryMsg::GetHouseEdge {}).unwrap();
+        let resp2: HouseEdgeResponse = from_json(&bin2).unwrap();
+        assert_eq!(resp2.house_edge_bps, 800);
     }
 }

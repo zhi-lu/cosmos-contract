@@ -16,7 +16,8 @@ docker run --rm -v "$(pwd)":/code \
 wasmd tx wasm store ./artifacts/play_contract.wasm  --from "wasmxxxxxxxxxx" --gas-prices 0.001uatom --gas 2000000  --broadcast-mode sync
 
 # 创建合约实例 / Instantiate contract
-wasmd tx wasm instantiate your_contract_id '{}' \                                                                                     
+# house_edge_bps: 庄家抽水比例（基点），100 = 1%，最高 1000 = 10%，可选参数，默认 0
+wasmd tx wasm instantiate your_contract_id '{"house_edge_bps": 500}' \                                                                                     
   --from wasmxxxxxxxxxx \
   --label "play_game" \
   --admin wasmxxxxxxxxxx \
@@ -51,6 +52,35 @@ curl https://${IP}:${REST_PORT}/cosmos/tx/v1beta1/txs/${tx_hash}
 | 斗牛     | Bull Fight        | 五张牌比牛，含五小牛/四炸/五花牛/牛牛等特殊牌型 / Five-card bull game with special hands                      |
 
 ## 使用说明 / Usage Notes
+
+### 庄家抽水 / House Edge (Rake)
+
+合约支持设置庄家抽水比例，仅对玩家的**净赢利部分**收取，不影响退还本金（平局时全额退还）。
+
+- 单位：基点（bps），100 基点 = 1%
+- 范围：0 ~ 1000 基点（0% ~ 10%）
+- 默认值：0（不抽水）
+
+**初始化时设置：**
+```json
+{"house_edge_bps": 500}
+```
+
+**修改抽水比例（仅 owner）：**
+```json
+{"update_house_edge": {"new_house_edge_bps": 300}}
+```
+
+**查询当前抽水比例：**
+```json
+{"get_house_edge": {}}
+```
+
+**示例：** 玩家下注 1,000,000 uatom 赢得 2× 赔付，抽水 5%（500 bps）
+- 总赔付（含本金）= 2,000,000
+- 净赢利 = 2,000,000 - 1,000,000 = 1,000,000
+- 抽水 = 1,000,000 × 5% = 50,000
+- 实际到手 = 2,000,000 - 50,000 = **1,950,000 uatom**
 
 ### 环境要求 / Requirements
 
